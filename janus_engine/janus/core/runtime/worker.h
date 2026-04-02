@@ -1,0 +1,129 @@
+#pragma once
+
+#include <folly/futures/Future.h>
+#include <torch/torch.h>
+
+#include "common/types.h"
+#include "forward_params.h"
+#include "framework/model/causal_lm.h"
+#include "framework/model/model_args.h"
+#include "framework/model/model_input_params.h"
+#include "framework/quant_args.h"
+#include "framework/state_dict/state_dict.h"
+#include "runtime/executor.h"
+#include "runtime/options.h"
+#include "runtime/worker_impl.h"
+#include "util/threadpool.h"
+
+namespace janus {
+
+class Worker {
+ public:
+  Worker(const ParallelArgs& parallel_args,
+         const torch::Device& device,
+         const runtime::Options& options,
+         WorkerType worker_type);
+
+  ~Worker();
+
+  // initialize model, cache manager. blocking call
+  bool init_model(const std::string& model_weights_path,
+                  int32_t random_seed,
+                  MasterStatus master_status);
+
+  bool sleep(MasterStatus master_status);
+
+  bool wakeup(const WakeupOptions& options);
+
+  folly::SemiFuture<bool> wakeup_async(const WakeupOptions& options);
+
+  std::tuple<int64_t, int64_t> estimate_kv_cache_capacity();
+
+  // allocate kv cache. blocking call
+  bool allocate_kv_cache(
+      const std::vector<std::vector<int64_t>>& kv_cache_shape);
+
+  void get_device_info(std::string& device_ip, uint16_t& port);
+
+  void get_p2p_addr(std::string& p2p_addr);
+
+  void get_cache_info(uint64_t& cluster_id,
+                      std::string& addr,
+                      int64_t& k_cache_id,
+                      int64_t& v_cache_id);
+
+  bool link_cluster(const std::vector<uint64_t>& cluster_ids,
+                    const std::vector<std::string>& addrs,
+                    const std::vector<std::string>& device_ips,
+                    const std::vector<uint16_t>& ports);
+
+  bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
+                      const std::vector<std::string>& addrs,
+                      const std::vector<std::string>& device_ips,
+                      const std::vector<uint16_t>& ports);
+
+  // D2D link for weight transfer
+  bool link_d2d(const std::string& remote_addr);
+  bool unlink_d2d(const std::string& remote_addr);
+
+  const bool is_driver();
+
+  // prepare input for execution
+  ForwardInput prepare_inputs(Batch& batch);
+
+  std::optional<ForwardOutput> step(const ForwardInput& inputs);
+
+  // initialize model, cache manager. async call
+  folly::SemiFuture<bool> init_model_async(
+      const std::string& model_weights_path,
+      int32_t random_seed,
+      MasterStatus master_status);
+
+  folly::SemiFuture<std::tuple<int64_t, int64_t>>
+  estimate_kv_cache_capacity_async();
+
+  // initialize kv cache. async call
+  folly::SemiFuture<bool> allocate_kv_cache_async(
+      const std::vector<std::vector<int64_t>>& kv_cache_shape);
+
+  // initialize kv cache with kv cache transfer. async call
+  virtual folly::SemiFuture<bool> allocate_kv_cache_with_transfer_async(
+      const std::vector<std::vector<int64_t>>& kv_cache_shape);
+
+  virtual folly::SemiFuture<bool> pull_kv_blocks_async(
+      const uint64_t src_cluster_id,
+      const std::string& src_addr,
+      const int64_t src_k_cache_id,
+      const int64_t src_v_cache_id,
+      const std::vector<uint64_t>& src_blocks,
+      const std::vector<uint64_t>& dst_blocks);
+
+  virtual uint32_t transfer_kv_blocks(
+      const uint64_t batch_id,
+      const std::vector<BlockTransferInfo>& block_transfer_info);
+
+  virtual uint32_t transfer_kv_blocks(
+      const uint64_t batch_id,
+      Slice<BlockTransferInfo>& block_transfer_info);
+
+  // Run the model on the given input. async call
+  // the future returns a successfull status with no meaningful value
+  folly::SemiFuture<std::optional<ForwardOutput>> step_async(
+      const ForwardInput& inputs);
+
+  folly::SemiFuture<folly::Unit> process_group_test_async();
+
+  const torch::Device& device() const;
+
+  folly::SemiFuture<std::optional<ForwardOutput>> get_last_step_result_async();
+
+  int64_t get_active_activation_memory();
+
+  folly::SemiFuture<int64_t> get_active_activation_memory_async();
+
+ private:
+  WorkerImpl* impl_ = nullptr;
+  ThreadPool threadpool_;
+};
+
+}  // namespace janus

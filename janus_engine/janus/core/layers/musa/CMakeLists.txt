@@ -1,0 +1,29 @@
+include(cc_library)
+
+cc_library(
+  NAME
+    musa_layers
+  HDRS
+    ../cuda/flashinfer_workspace.h
+    musa_layer_base.h
+    musa_qwen3_decoder_layer_impl.h
+    musa_lm_head_impl.h
+    attention.h
+    musa_mlp.h 
+  SRCS
+    ../cuda/flashinfer_workspace.cpp
+    musa_qwen3_decoder_layer_impl.cpp
+    musa_lm_head_impl.cpp
+    attention.cpp
+    musa_mlp.cpp
+  DEPS
+    "-Wl,--whole-archive"
+    "-Wl,--no-whole-archive"
+    kv_cache
+    state_dict
+    model
+    common
+    torch
+    torch_musa
+    MTTOplib
+)

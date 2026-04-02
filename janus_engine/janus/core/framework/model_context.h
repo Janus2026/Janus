@@ -1,0 +1,100 @@
+#pragma once
+
+#if defined(USE_NPU)
+#include <acl/acl.h>
+
+#include "layers/npu/buffer/atb_workspace.h"
+#endif
+
+#include <memory>
+#include <string>
+
+#include "core/framework/model/model_args.h"
+#include "core/framework/parallel_state/parallel_args.h"
+#include "core/framework/quant_args.h"
+#include "framework/parallel_state/parallel_args.h"
+
+namespace janus {
+
+// Internal optimization configuration.
+// This struct holds all optimization techniques that are automatically
+// determined from model and quantization arguments and other internal factors,
+// not set directly by users.
+struct OptimizationConfig {
+  // Enable use of fused computation kernels.
+  bool enable_fused_spec_kernel = false;
+  bool enable_fused_mla_kernel = false;
+  bool enable_fused_indexer_qk = false;
+
+  // we can detailize this part later. for example:
+  // PROPERTY(bool, enable_fused_mlp_kernel) = false;
+};
+
+class ModelContext {
+ public:
+  ModelContext() : parallel_args_(1, 1, nullptr) {};
+
+  ModelContext(const ParallelArgs& input_parallel_args,
+               const ModelArgs& model_args,
+               const QuantArgs& quant_args,
+               const torch::TensorOptions& tensor_options);
+
+#if defined(USE_NPU)
+  ModelContext(const ParallelArgs& input_parallel_args,
+               const ModelArgs& model_args,
+               const QuantArgs& quant_args,
+               const torch::TensorOptions& tensor_options,
+               atb::Context* context);
+#endif
+
+  const ModelArgs& get_model_args() const { return model_args_; }
+
+  const QuantArgs& get_quant_args() const { return quant_args_; }
+
+  const ParallelArgs& get_parallel_args() const { return parallel_args_; }
+
+  const torch::TensorOptions& get_tensor_options() const {
+    return tensor_options_;
+  }
+
+  const OptimizationConfig& get_optimization_config() const {
+    return optimization_config_;
+  }
+
+#if defined(USE_NPU)
+  const atb::Context* get_atb_context() const { return context_; }
+  std::shared_ptr<AtbWorkspace> get_atb_workspace() const {
+    return atb_workspace_;
+  }
+#endif
+
+  void set_image_embedding_mode(bool image_embedding_mode) {
+    model_args_.image_embedding_mode() = image_embedding_mode;
+  }
+
+  const std::string& get_model_id() const { return model_id_; }
+  void set_model_id(const std::string& model_id) { model_id_ = model_id; }
+  const std::string& get_model_path() const { return model_path_; }
+  void set_model_path(const std::string& model_path) { model_path_ = model_path; }
+
+ private:
+  // derive optimization config based on model args, quant args and other
+  // factors
+  void derive_optimization_config();
+
+  std::string model_id_;  // Model identifier for XTensor multi-model support
+  std::string model_path_;
+  ModelArgs model_args_;
+  QuantArgs quant_args_;
+  ParallelArgs parallel_args_;
+  torch::TensorOptions tensor_options_;
+  OptimizationConfig optimization_config_;
+
+#if defined(USE_NPU)
+  // used for npu atb
+  atb::Context* context_;
+  std::shared_ptr<AtbWorkspace> atb_workspace_;
+#endif
+};
+
+}  // namespace janus

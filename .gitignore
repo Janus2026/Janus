@@ -1,0 +1,40 @@
+# etcd data
+default.etcd/
+
+# Ascend kernel meta
+kernel_meta/
+
+# logs
+logs/
+*.log
+
+# build artifacts
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.o
+*.a
+*.egg-info/
+*.egg
+dist/
+.cache/
+
+# IDE
+.vscode*/
+.idea/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# local / runtime
+local/
+*.swp
+*.swo
+*~
+
+# Gemini
+.gemini/

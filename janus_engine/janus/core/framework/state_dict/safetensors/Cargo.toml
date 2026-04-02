@@ -1,0 +1,13 @@
+[package]
+name = "rust_safetensors"
+version = "0.6.0"
+edition = "2021"
+
+[lib]
+name = "rust_safetensors"
+crate-type = ["staticlib"]
+
+[dependencies]
+thiserror = "1.0"
+safetensors = "0.6.0"
+

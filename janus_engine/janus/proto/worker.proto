@@ -1,0 +1,312 @@
+syntax = "proto3";
+
+package janus.proto;
+option cc_enable_arenas = true;
+option cc_generic_services = true;
+
+import "common.proto";
+import "tensor.proto";
+import "disagg_pd.proto";
+
+// NPU: HcclRootInfo
+message CommInfo {
+  bytes comm_info = 1;
+}
+
+message InitModelRequest {
+  string model_weights_path = 1;
+  int32 random_seed = 2;
+  MasterStatus master_status = 3;
+}
+
+message ActivationMemory {
+  int64 active_activation_memory = 1;
+}
+
+message DeviceMemory {
+  int64 available_memory = 1;
+  int64 total_memory = 2;
+}
+
+message KVCacheShape {
+  repeated int64 key_shape = 1;
+  repeated int64 value_shape = 2;
+  repeated int64 index_shape = 3;
+  repeated int64 conv_shape = 4;
+  repeated int64 ssm_shape = 5;
+}
+
+message AllocateKVCacheRequest {
+  KVCacheShape kv_cache_shape = 1;
+}
+
+message SleepRequest {
+  MasterStatus master_status = 1;
+}
+
+message WakeupRequest {
+  MasterStatus master_status = 1;
+  repeated string remote_addrs = 2;
+  // Per-remote-addr weight segments (index matches remote_addrs)
+  // Each entry contains ordered segments to pull from that remote source
+  repeated WakeupWeightSegmentList src_weight_segments = 3;
+}
+
+// A single weight segment for D2D transfer
+message WakeupWeightSegment {
+  uint64 offset = 1;  // Byte offset from source GlobalXTensor base
+  uint64 size = 2;    // Segment size in bytes
+}
+
+// List of weight segments for one remote source
+message WakeupWeightSegmentList {
+  repeated WakeupWeightSegment segments = 1;
+}
+
+message D2DLinkWorkerRequest {
+  string remote_addr = 1; 
+}
+
+message PullKVCacheRequest {
+  uint64 cluster_id = 1;
+  string addr = 6;
+  int64 k_cache_id = 2;
+  int64 v_cache_id = 3;
+  repeated uint64 src_blocks = 4;
+  repeated uint64 dst_blocks = 5;
+}
+
+enum TransferType {
+  G2H = 0;
+  H2D = 1;
+  D2G = 2;
+}
+
+message BlockTransferInfo {
+  int32 src_block_id = 1;
+  int32 dst_block_id = 2;
+  bytes hash_key = 3;
+}
+
+message BlockTransferInfos {
+  uint64 batch_id = 1;
+  TransferType transfer_type = 2;
+  repeated BlockTransferInfo transfer_infos = 3;
+}
+
+message TransferStatus {
+ uint32 success_cnt = 1;
+}
+
+message DeviceInfo {
+  string device_ip = 1;
+  uint32 listen_port = 2;
+}
+
+message P2PAddr {
+  string addr = 1;
+}
+
+message CacheInfo {
+  uint64 cluster_id = 1;
+  string addr = 4;
+  int64 k_cache_id = 2;
+  int64 v_cache_id = 3;
+}
+
+message ClusterInfo {
+  repeated uint64 cluster_ids = 1;
+  repeated string device_ips = 2;
+  repeated uint32 ports = 3;
+  repeated string addrs = 4;
+}
+
+message InstanceInfo {
+  string name = 1;
+  string rpc_address = 2;
+  string type = 3;
+  repeated uint64 cluster_ids = 4;
+  repeated string addrs = 8;
+  repeated int64 k_cache_ids = 5;
+  repeated int64 v_cache_ids = 6;
+  int32 dp_size = 7;
+}
+
+message TransferKVInfo {
+  string request_id = 1;
+  repeated uint64 local_blocks_ids = 2;
+  repeated uint64 remote_blocks_ids = 3;
+  int32 dp_rank = 4;
+  InstanceInfo remote_instance_info = 5;
+  // XTensor mode: destination offsets from D-node (per-layer)
+  // Each XTensorLayerOffsets contains K/V offsets and optional index offsets
+  // for all blocks at one layer.
+  repeated XTensorLayerOffsets dst_xtensor_layer_offsets = 6;
+  XTensorBlockBytes dst_xtensor_block_bytes = 7;
+}
+
+message EplbInfo {
+  int32 prepare_layer_id = 1;
+  repeated int32 expert_ids = 2;
+  int32 update_layer_id = 3;
+};
+
+message RequestSamplingParam {
+  float frequency_penalty = 1;
+  float presence_penalty = 2;
+  float repetition_penalty = 3;
+  float temperature = 4;
+  float top_p = 5;
+  int64 top_k = 6;
+  bool logprobs = 7;
+  int64 top_logprobs = 8;
+  bool do_sample = 9;
+  bool is_embeddings = 10;
+  int32 beam_width = 11;
+}
+
+message UniqueTokenIds {
+  repeated int64 unique_token_ids = 1;
+}
+
+message UniqueTokenCounts {
+  repeated int32 unique_token_counts = 1;
+}
+
+message BlockTables {
+  repeated int32 block_tables = 1;
+}
+
+message BlockPair {
+  int32 device_block_id = 1;
+  int32 host_block_id = 2;
+}
+
+message TensorList {
+  repeated Tensor tensors = 1;
+}
+
+message MMValue {
+  oneof value {
+    Tensor single_tensor = 1;
+    TensorList tensor_list = 2;
+  }
+}
+
+message MMData {
+  uint32 type = 1;
+  map<string, MMValue> dict = 2;
+}
+
+message ForwardInput {
+  // flatten the token ids and positions
+  repeated int32 flatten_tokens_vec = 1;
+  repeated int32 flatten_positions_vec = 2;
+  // sleceted tokens to return logits, including generated tokens and last
+  // prompt token
+  repeated RequestSamplingParam sampling_params = 3;
+  repeated int32 selected_token_idxes = 4;
+  // track the last token of selected tokens for sampling
+  repeated int32 sample_idxes = 5;
+  // track the unique token ids and counts in the batch
+  repeated UniqueTokenIds unique_token_ids_vec = 6;
+  repeated UniqueTokenCounts unique_token_counts_vec = 7;
+  repeated int32 unique_token_lens_vec = 8;
+  // bool empty_kv_cache = 9;
+  uint32 max_seq_len = 10;
+  uint32 q_max_seq_len = 11;
+  repeated int32  seq_lens = 12;
+  repeated int32  q_seq_lens = 13;
+  repeated int32 paged_kv_indptr = 14;
+  repeated int32 paged_kv_indices = 15;
+  repeated int32 paged_kv_last_page_len = 16;
+  // slot ids for new token
+  repeated int32 new_token_slot_ids = 17;
+  repeated BlockTables block_tables_vec = 18;
+  int32 num_sequences = 19;
+  repeated int32 dp_global_token_nums = 20;
+  // bool global_empty_kv_cache = 21;
+  repeated TransferKVInfo transfer_kv_infos = 22;
+  repeated Embeddings embeds = 23;
+  // uint32 prefill_seq_len = 24;
+  repeated int32 embedding_ids = 25;
+  repeated int32 extra_token_ids = 26;
+  EplbInfo eplb_info =27;
+  repeated BlockTransferInfo swap_blocks = 28;
+  // block copy kernel
+  repeated int32 src_block_indices = 32;
+  repeated int32 dst_block_indices = 33;
+  repeated int32 cum_sum = 34;
+  // beam search kernel
+  repeated float acc_logprob_vec = 37;
+  uint64 batch_id = 38;
+  int32 batch_forward_type = 39;
+  MMData mm_data = 40;
+  repeated int32 q_cu_seq_lens = 41;
+  repeated int32 dp_is_decode = 42;
+  repeated int32 kv_cache_tokens_nums = 43;
+  repeated string request_ids = 44;
+}
+
+ message BatchedForwardInputs {
+   repeated ForwardInput micro_inputs = 1;
+ }
+
+message Embeddings {
+  repeated float vals = 1;
+}
+
+message Token {
+  int64 id = 1;
+  oneof lp {
+    bool empty = 2;
+    float logprob = 3;
+  }
+  repeated int64 top_tokens = 4;
+  repeated float top_logprobs = 5;
+  Embeddings embeddings = 6;
+};
+
+message SquenceOutput {
+  repeated Token tokens = 1;
+}
+
+message ForwardOutput {
+  repeated SquenceOutput outputs = 2;
+  repeated int64 expert_load_data = 3;
+  int32 prepared_layer_id = 4;
+  repeated int32 src_seq_idxes = 5;
+  repeated int32 out_tokens = 6;
+  repeated float out_logprobs = 7;
+}
+
+// master create Collective service
+// to sync all workers.
+service Collective {
+  rpc Sync(AddressInfo) returns (CommUniqueIdList);
+}
+
+// Worker receive action from master engine.
+service DistributeWorker {
+  rpc Hello (Status) returns (Status);
+  rpc InitModel (InitModelRequest) returns (Status);
+  rpc ProcessGroupTest (Empty) returns (Status);
+  rpc ProfileDeviceMemory (Empty) returns (DeviceMemory);
+  rpc AllocateKVCache (AllocateKVCacheRequest) returns (Status);
+  rpc AllocateKVCacheWithTransfer(AllocateKVCacheRequest) returns (Status) {}
+  rpc PullKVCache(PullKVCacheRequest) returns (Status) {}
+  rpc GetDeviceInfo(Empty) returns (DeviceInfo) {}
+  rpc GetP2PAddr(Empty) returns (P2PAddr) {}
+  rpc GetCacheInfo(Empty) returns (CacheInfo) {}
+  rpc LinkCluster(ClusterInfo) returns (Status) {}
+  rpc UnlinkCluster(ClusterInfo) returns (Status) {}
+  rpc LinkD2D(D2DLinkWorkerRequest) returns (Status) {}
+  rpc UnlinkD2D(D2DLinkWorkerRequest) returns (Status) {}
+  rpc ExecuteModel (ForwardInput) returns (ForwardOutput);
+  rpc GetLastStepResult (Empty) returns (ForwardOutput);
+  rpc GetActiveActivationMemory (Empty) returns (ActivationMemory);
+  rpc TransferBlocks(BlockTransferInfos) returns (TransferStatus) {}
+  rpc PrefetchFromStorage(BlockTransferInfos) returns (Status) {}
+  rpc Sleep (SleepRequest)  returns (Status);
+  rpc Wakeup (WakeupRequest) returns (Status);
+}

@@ -1,0 +1,59 @@
+#pragma once
+
+#if defined(USE_NPU)
+#include <acl/acl.h>
+#endif
+
+#include <memory>
+
+#include "core/framework/model/model_args.h"
+#include "core/framework/model_context.h"
+#include "core/framework/quant_args.h"
+#include "framework/parallel_state/parallel_args.h"
+
+namespace janus {
+
+class DiTModelContext {
+ public:
+  DiTModelContext() : parallel_args_(1, 1, nullptr) {};
+
+  DiTModelContext(const ParallelArgs& input_parallel_args,
+                  const std::unordered_map<std::string, ModelArgs>& model_args,
+                  const std::unordered_map<std::string, QuantArgs>& quant_args,
+                  const torch::TensorOptions& tensor_options,
+                  const std::string& model_type);
+
+  const ModelArgs& get_model_args(const std::string& component) const;
+
+  const QuantArgs& get_quant_args(const std::string& component) const;
+
+#if defined(USE_NPU)
+  ModelContext get_model_context(const std::string& component) const;
+#endif
+
+  const ParallelArgs& get_parallel_args() const { return parallel_args_; }
+
+  const torch::TensorOptions& get_tensor_options() const {
+    return tensor_options_;
+  }
+
+  const std::string& model_type() const { return model_type_; }
+
+#if defined(USE_NPU)
+  const atb::Context* get_atb_context() const { return context_; }
+#endif
+
+ private:
+  std::unordered_map<std::string, ModelArgs> model_args_;
+  std::unordered_map<std::string, QuantArgs> quant_args_;
+  ParallelArgs parallel_args_;
+  torch::TensorOptions tensor_options_;
+  std::string model_type_;
+
+#if defined(USE_NPU)
+  // used for npu atb
+  atb::Context* context_;
+#endif
+};
+
+}  // namespace janus

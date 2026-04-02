@@ -1,0 +1,81 @@
+#include "vlm_worker_impl.h"
+
+#include <c10/core/DeviceGuard.h>
+#include <folly/Unit.h>
+#include <folly/futures/Future.h>
+#include <glog/logging.h>
+#include <torch/torch.h>
+
+#include <memory>
+#include <optional>
+#include <utility>
+
+#include "common/metrics.h"
+#include "framework/kv_cache/kv_cache.h"
+#include "framework/model/model_input_params.h"
+#include "framework/state_dict/state_dict.h"
+#include "models/model_registry.h"
+#include "util/threadpool.h"
+#include "util/timer.h"
+
+namespace janus {
+
+VLMWorkerImpl::VLMWorkerImpl(const ParallelArgs& parallel_args,
+                             const torch::Device& device,
+                             const runtime::Options& options)
+    : WorkerImpl(parallel_args, device, options) {
+  device_.set_device();
+}
+
+bool VLMWorkerImpl::init_model(ModelContext& context) {
+  CHECK(model_ == nullptr) << "Model is already initialized.";
+
+  // initialize model
+  context.set_image_embedding_mode(false);
+  model_ = create_vlm_model(context);
+  CHECK(model_ != nullptr) << "Failed to create model.";
+  model_executor_ = std::make_unique<Executor>(
+      model_.get(), context.get_model_args(), device_, options_);
+  return true;
+}
+
+std::optional<ForwardOutput> VLMWorkerImpl::step(const ForwardInput& input) {
+  Timer timer;
+  // TODO guojinrong, to adapt multi stream parallel later
+  // call model executor forward to get hidden states
+  auto model_output = model_executor_->forward(
+      input.token_ids, input.positions, kv_caches_, input.input_params);
+  auto& sampling_params = input.sampling_params;
+  torch::Tensor logits;
+  if (sampling_params.selected_token_idxes.defined()) {
+    logits = model_->logits(model_output.hidden_states,
+                            sampling_params.selected_token_idxes);
+  }
+
+  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
+
+  if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
+      !options_.enable_speculative_decode()) {
+    auto ret = device_.synchronize_default_stream();
+    return std::nullopt;
+  }
+
+  ForwardOutput output;
+  if (sampling_params.selected_token_idxes.defined()) {
+    auto sample_output = sampler_->forward(logits, sampling_params);
+    output.logits = logits;
+    COUNTER_ADD(execution_latency_seconds_sampling, timer.elapsed_seconds());
+
+    // set sample output to output
+    output.sample_output = sample_output;
+
+    // carry over the sampling params
+    output.do_sample = sampling_params.do_sample;
+    output.logprobs = sampling_params.logprobs;
+    output.max_top_logprobs = sampling_params.max_top_logprobs;
+  }
+  auto ret = device_.synchronize_default_stream();
+  return output;
+}
+
+}  // namespace janus

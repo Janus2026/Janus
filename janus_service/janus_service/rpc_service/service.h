@@ -1,0 +1,133 @@
+#pragma once
+
+#include <mutex>
+#include <unordered_map>
+
+#include "chat.pb.h"
+#include "common/options.h"
+#include "common/types.h"
+#include "common/janus/output.h"
+#include "common/janus/status.h"
+#include "completion.pb.h"
+#include "janus_rpc_service.pb.h"
+
+namespace janus_service {
+
+struct ServiceConfig {
+  ServiceConfig(bool decode_to_service)
+      : enable_decode_response_to_service(decode_to_service) {}
+
+  bool enable_decode_response_to_service = false;
+};
+
+class Scheduler;
+class InstanceMgr;
+
+class JanusRpcServiceImpl final {
+ public:
+  JanusRpcServiceImpl(const Options& options, Scheduler* scheduler);
+  ~JanusRpcServiceImpl();
+
+  void heartbeat(const proto::HeartbeatRequest* req);
+
+  InstanceMetaInfo get_instance_info(const std::string& instance_name);
+
+  ServiceConfig get_config();
+
+  std::vector<std::string> get_static_decode_list(
+      const std::string& prefill_name);
+
+  std::vector<std::string> get_static_prefill_list(
+      const std::string& decode_name);
+
+ public:
+  // handle generations from prefill/decode instance
+  bool handle_generation(const llm::RequestOutput& request_output);
+
+  // MixPD: wakeup/sleep model with instance tag
+  bool wakeup_model(const std::string& instance_name,
+                    const std::string& model_id,
+                    InstanceTag tag);
+  bool sleep_model(const std::string& instance_name,
+                   const std::string& model_id);
+
+ private:
+  Options options_;
+
+  // not own
+  Scheduler* scheduler_;
+
+  // In disagg pd mode, we support receive generated token from
+  // prefill or from decode directly.
+  // 1.
+  // [service] ---req---> [prefill] ---req---> [decode]
+  // [service] <---first resp--- [prefill] ---first resp---> [decode]
+  // [service] <---resp--- [prefill] <---resp--- [decode]
+  //
+  // 2.
+  // [service] ---req---> [prefill] ---req---> [decode]
+  // [service] <---first resp-- [prefill] --first resp---> [decode]
+  // [service] <---resp-- [decode]
+  //
+  bool enable_decode_response_to_service_ = false;
+};
+
+// parse proto data and call JanusRpcService
+class JanusRpcService : public proto::JanusRpcService {
+ public:
+  explicit JanusRpcService(const Options& options, Scheduler* scheduler);
+  virtual ~JanusRpcService();
+
+  virtual void Hello(google::protobuf::RpcController* cntl_base,
+                     const proto::Empty* req,
+                     proto::Status* resp,
+                     google::protobuf::Closure* done) override;
+
+  virtual void Heartbeat(google::protobuf::RpcController* cntl_base,
+                         const proto::HeartbeatRequest* req,
+                         proto::Status* resp,
+                         google::protobuf::Closure* done) override;
+
+  virtual void GetInstanceInfo(google::protobuf::RpcController* cntl_base,
+                               const proto::InstanceID* req,
+                               proto::InstanceMetaInfo* resp,
+                               google::protobuf::Closure* done) override;
+
+  virtual void GetStaticDecodeList(google::protobuf::RpcController* cntl_base,
+                                   const proto::InstanceID* req,
+                                   proto::InstanceIDs* resp,
+                                   google::protobuf::Closure* done) override;
+
+  virtual void GetStaticPrefillList(google::protobuf::RpcController* cntl_base,
+                                    const proto::InstanceID* req,
+                                    proto::InstanceIDs* resp,
+                                    google::protobuf::Closure* done) override;
+
+  // janus service receive response from decode instance directly in disagg pd
+  // mode. This can eliminate the cost brought by forwarding through prefill.
+  virtual void Generations(google::protobuf::RpcController* cntl_base,
+                           const proto::DisaggStreamGenerations* req,
+                           proto::StatusSet* resp,
+                           google::protobuf::Closure* done) override;
+
+  virtual void GetConfig(google::protobuf::RpcController* cntl_base,
+                         const proto::Empty* req,
+                         proto::ServiceConfig* resp,
+                         google::protobuf::Closure* done) override;
+
+  // Tag management RPCs for MIX PD scheduling
+  virtual void AssignTag(google::protobuf::RpcController* cntl_base,
+                         const proto::TagAssignRequest* req,
+                         proto::TagAssignResponse* resp,
+                         google::protobuf::Closure* done) override;
+
+  virtual void RemoveTag(google::protobuf::RpcController* cntl_base,
+                         const proto::TagAssignRequest* req,
+                         proto::TagAssignResponse* resp,
+                         google::protobuf::Closure* done) override;
+
+ private:
+  std::unique_ptr<JanusRpcServiceImpl> janus_rpc_service_impl_;
+};
+
+}  // namespace janus_service

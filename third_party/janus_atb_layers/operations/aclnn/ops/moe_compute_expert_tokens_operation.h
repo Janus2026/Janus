@@ -1,0 +1,78 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#ifndef ATB_SPEED_PLUGIN_ACLNN_MOE_COMPUTE_EXPERT_TOKENS_OPERATION_H
+#define ATB_SPEED_PLUGIN_ACLNN_MOE_COMPUTE_EXPERT_TOKENS_OPERATION_H
+#include "operations/aclnn/core/acl_nn_operation.h"
+#include "operations/aclnn/core/acl_nn_operation_cache.h"
+#include "atb_speed/utils/operation_util.h"
+
+namespace atb_speed {
+namespace common {
+
+struct MoeComputeExpertTokensParam {
+    /// The total number of experts utilized by the model
+    int32_t expertNum = 8;
+};
+
+/// This class defines an operator that computes the number of tokens that is processed by each expert
+///
+/// This class makes uses of `aclnnMoeComputeExpertTokensGetWorkspaceSize` and `aclnnMoeComputeExpertTokens`
+/// form the AscendCL API.
+///
+/// Inputs to the operator
+/// Name         | Dtype | Shape |
+/// -------------|-------|-------|
+/// input        | int32 | [m*k] |
+///
+/// Outputs of the operator:
+/// Name         | Dtype | Shape |
+/// -------------|-------|-------|
+/// output       | int64 | [e]   |
+/// Note: m is the length of input tokens, k is the number of experts selected for each token,
+/// e is the total number of experts used by the model
+///
+/// Example:
+/// \code
+/// enum TensorIdx : uint32_t {
+///     INPUT = 0,
+///     OUT,
+/// };
+///
+/// atb::Node &expertTokenNode = opGraph.nodes.at(nodeId++);
+/// expertTokenNode.operation = new atb_speed::common::MoeComputeExpertTokensOperation("ArgsortNode");
+/// expertTokenNode.inTensorIds = {INPUT};
+/// expertTokenNode.outTensorIds = {OUTPUT};
+/// \endcode
+
+class MoeComputeExpertTokensOperation : public AclNNOperation {
+public:
+    explicit MoeComputeExpertTokensOperation(const std::string &name, MoeComputeExpertTokensParam param);
+    ~MoeComputeExpertTokensOperation() override;
+    atb::Status InferShape(const atb::SVector<atb::TensorDesc> &inTensorDescs,
+                           atb::SVector<atb::TensorDesc> &outTensorDescs) const override;
+    uint32_t GetInputNum() const override;
+    uint32_t GetOutputNum() const override;
+
+private:
+    int SetAclNNWorkspaceExecutor() override;
+    int ExecuteAclNNOp(uint8_t *workspace, aclrtStream &stream) override;
+
+    MoeComputeExpertTokensParam param_;
+};
+
+}  // namespace common
+}  // namespace atb_speed
+#endif  // ATB_SPEED_PLUGIN_ACLNN_MOE_TOPK_SOFTMAX_OPERATION_H

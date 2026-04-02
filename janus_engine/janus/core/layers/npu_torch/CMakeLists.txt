@@ -1,0 +1,20 @@
+include(cc_library)
+
+cc_library(
+  NAME
+    npu_torch_layers
+  HDRS
+    fused_moe.h
+    attention.h
+    qwen3_next_attention.h
+    qwen3_next_gated_delta_net.h
+    qwen3_next_decoder_layer_impl.h
+  SRCS
+    fused_moe.cpp
+    attention.cpp
+    qwen3_next_attention.cpp
+    qwen3_next_gated_delta_net.cpp
+    qwen3_next_decoder_layer_impl.cpp
+  DEPS
+    :common_layers
+)

@@ -1,0 +1,69 @@
+#pragma once
+
+#include <c10/core/Device.h>
+#include <torch/torch.h>
+
+#include <cstdint>
+#include <memory>
+
+#include "stream.h"
+
+namespace janus {
+
+class Device {
+ public:
+  explicit Device(const torch::Device& device);
+  explicit Device(const int32_t device_index);
+  ~Device() = default;
+  operator torch::Device() const;
+
+  void set_device() const;
+
+  void set_seed(uint64_t seed = 42) const;
+
+  const torch::Device& unwrap() const;
+  int32_t index() const;
+
+  void init_device_context() const;
+
+  static int device_count();
+  static std::string type_str();
+  static torch::DeviceType type_torch();
+  static int32_t sm_count();
+  static bool is_enable_pdl();
+  static bool is_support_sm90a();
+  static bool is_support_sm100a();
+  static bool is_support_sm100f();
+  static bool is_support_sm120a();
+
+  int64_t total_memory();
+  int64_t free_memory();
+  static void empty_cache(int32_t device_index);
+
+  int synchronize_default_stream();
+  std::unique_ptr<Stream> get_stream_from_pool(const int32_t timeout = -1);
+
+  // get the current stream
+  std::unique_ptr<Stream> current_stream() const;
+
+ private:
+  struct DeviceMem {
+    int64_t total_memory;
+    int64_t free_memory;
+  };
+
+  DeviceMem get_device_mem() const;
+
+ private:
+  torch::Device device_;
+
+  // only used for cuda
+  static int32_t sm_count_;
+  static bool enable_pdl_;
+  static bool support_sm90a_;
+  static bool support_sm100a_;
+  static bool support_sm100f_;
+  static bool support_sm120a_;
+};
+
+}  // namespace janus

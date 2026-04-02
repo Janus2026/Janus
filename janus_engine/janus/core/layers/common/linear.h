@@ -1,0 +1,288 @@
+#pragma once
+
+#include <glog/logging.h>
+#include <torch/torch.h>
+
+#include "core/framework/model_context.h"
+#include "framework/parallel_state/parallel_args.h"
+#include "framework/quant_args.h"
+#include "framework/state_dict/state_dict.h"
+#include "framework/state_dict/utils.h"
+
+namespace janus {
+namespace layer {
+
+// extra args for parallel linear behavior.
+struct LinearExtraArgs {
+  // parameters for fused smoothquant behavior
+  std::string act_mode;
+  bool is_gated;
+
+  // default constructor
+  LinearExtraArgs(const std::string& act_mode_ = "none", bool is_gated_ = false)
+      : act_mode(act_mode_), is_gated(is_gated_) {}
+};
+
+// Linear layer with column parallelism.
+// The linear layer is defined as Y = XA + b. A is parallelized along
+// its second dimension as A = [A_1, ..., A_p].
+class ColumnParallelLinearImpl : public torch::nn::Module {
+ public:
+  ColumnParallelLinearImpl(
+      int64_t in_features,
+      int64_t out_features,
+      bool bias,
+      bool gather_output,
+      const QuantArgs& quant_args,
+      ProcessGroup* process_group,
+      const torch::TensorOptions& options,
+      const LinearExtraArgs& linear_extra_args = LinearExtraArgs());
+
+  ColumnParallelLinearImpl(const ModelContext& context);
+
+  torch::Tensor forward(torch::Tensor input);
+
+  // load the weight from the checkpoint
+  void load_state_dict(const StateDict& state_dict);
+
+  // special load_state_dict for fused cases
+  void load_state_dict(const StateDict& state_dict,
+                       const std::vector<std::string>& prefixes);
+
+  // load_state_dict for merged weights with variable shard sizes
+  void load_state_dict(const StateDict& state_dict,
+                       int32_t shard_tensor_count,
+                       const std::vector<int64_t>& shard_sizes);
+
+  void pretty_print(std::ostream& stream) const {
+    stream << name() << " " << weight_.sizes() << " " << weight_.device();
+  }
+
+  torch::Tensor weight() const {
+    if (qweight_is_loaded_) {
+      return qweight_;
+    }
+    return weight_;
+  }
+  torch::Tensor per_channel_scale() const { return per_channel_scale_; }
+  torch::Tensor weight_scale() const { return weight_scale_; }
+  ProcessGroup* process_group() const { return process_group_; }
+  std::optional<torch::Tensor> smooth() const {
+    if (smooth_is_loaded_) {
+      return smooth_;
+    }
+    return std::nullopt;
+  }
+
+  bool is_weight_loaded() const { return weight_is_loaded_; }
+
+  // Get FP8 input scale for fused RMSNorm+FP8 quantization
+  std::optional<torch::Tensor> get_input_scale() const;
+
+ private:
+  // parameter members, must be registered
+  // we allocate the transpose since linear performs XA^T.
+  // A^T: [out_features_per_partition, in_features]
+  DEFINE_FUSED_WEIGHT(weight);
+  DEFINE_FUSED_WEIGHT(qweight);
+  DEFINE_FUSED_WEIGHT(per_channel_scale);
+  DEFINE_WEIGHT(smooth);
+  DEFINE_FUSED_WEIGHT(bias);
+
+  // FP8 quantization parameters
+  DEFINE_FUSED_WEIGHT(weight_scale);  // FP8 weight scale
+  DEFINE_FUSED_WEIGHT(
+      input_scale);  // FP8 input (activation) scale for static quantization
+
+  int64_t rank_;
+  int64_t world_size_;
+  // whether to gather the output
+  bool gather_output_;
+  at::Device device_;
+  // parallel process group
+  ProcessGroup* process_group_;
+
+  // quantization args
+  QuantArgs quant_args_;
+  at::ScalarType output_dtype_;
+  LinearExtraArgs linear_extra_args_;
+};
+TORCH_MODULE(ColumnParallelLinear);
+
+class QKVParallelLinearImpl : public torch::nn::Module {
+ public:
+  QKVParallelLinearImpl(int64_t hidden_size,
+                        int64_t num_heads,
+                        int64_t num_kv_heads,
+                        int64_t head_size,
+                        int64_t num_kv_head_replicas,
+                        bool bias,
+                        bool gather_output,
+                        const ParallelArgs& parallel_args,
+                        const torch::TensorOptions& options,
+                        const QuantArgs& quant_args = QuantArgs{});
+
+  torch::Tensor forward(torch::Tensor input);
+
+  // load the weight from the checkpoint
+  void load_state_dict(const StateDict& state_dict,
+                       const std::vector<std::string>& prefixes);
+  void load_state_dict(const StateDict& state_dict);
+
+  void pretty_print(std::ostream& stream) const {
+    stream << name() << " " << weight().sizes() << " " << weight().device();
+  }
+
+  // return the weight (for testing)
+  torch::Tensor weight() const { return weight_; }
+
+  // Get FP8 input scale for fused RMSNorm+FP8 quantization
+  // For QKV, returns max of Q/K/V scales (per-tensor)
+  std::optional<torch::Tensor> get_input_scale() const;
+
+ private:
+  // parameter members, must be registered
+  // we allocate the transpose since linear performs XA^T.
+  // A^T: [out_features_per_partition, in_features]
+  DEFINE_FUSED_WEIGHT(weight);
+  DEFINE_FUSED_WEIGHT(bias);
+
+  // FP8 quantization parameters
+  DEFINE_FUSED_WEIGHT(weight_scale);  // FP8 weight scale
+  DEFINE_FUSED_WEIGHT(
+      input_scale);  // FP8 input (activation) scale for static quantization
+
+  int64_t rank_;
+  int64_t world_size_;
+  int64_t hidden_size_;
+  int64_t num_heads_;
+  int64_t num_kv_heads_;
+  int64_t head_size_;
+  int64_t num_kv_head_replicas_;
+  // whether to gather the output
+  bool gather_output_;
+  at::Device device_;
+  // parallel args
+  ParallelArgs parallel_args_;
+  torch::TensorOptions options_;
+  // quantization args
+  QuantArgs quant_args_;
+  at::ScalarType output_dtype_;
+};
+TORCH_MODULE(QKVParallelLinear);
+
+// Linear layer with row parallelism.
+//     The linear layer is defined as Y = XA + b. A is parallelized along
+//     its first dimension and X along its second dimension as:
+//                -   -
+//               | A_1 |
+//               | .   |
+//           A = | .   |       X = [X_1, ..., X_p]
+//               | .   |
+//               | A_p |
+//                -   -
+class RowParallelLinearImpl : public torch::nn::Module {
+ public:
+  RowParallelLinearImpl(const ModelContext& context);
+
+  RowParallelLinearImpl(
+      int64_t in_features,
+      int64_t out_features,
+      bool bias,
+      bool input_is_parallelized,
+      bool enable_result_reduction,
+      const QuantArgs& quant_args,
+      ProcessGroup* process_group,
+      const torch::TensorOptions& options,
+      const LinearExtraArgs& linear_extra_args = LinearExtraArgs());
+
+  torch::Tensor forward(torch::Tensor input);
+
+  // load the weight from the checkpoint
+  void load_state_dict(const StateDict& state_dict);
+
+  void pretty_print(std::ostream& stream) const {
+    stream << name() << " " << weight_.sizes() << " " << weight_.device();
+  }
+
+  // return the weight (for testing)
+  torch::Tensor weight() const {
+    if (qweight_is_loaded_) {
+      return qweight_;
+    }
+    return weight_;
+  }
+  torch::Tensor per_channel_scale() const { return per_channel_scale_; }
+  std::optional<torch::Tensor> smooth() const {
+    if (smooth_is_loaded_) {
+      return smooth_;
+    }
+    return std::nullopt;
+  }
+  ProcessGroup* process_group() const { return process_group_; }
+
+ private:
+  // parameter members, must be registered
+  // we allocate the transpose since linear performs XA^T.
+  // A^T: [out_features, in_features_per_partition]
+  DEFINE_WEIGHT(weight);
+  DEFINE_WEIGHT(qweight);
+  DEFINE_WEIGHT(per_channel_scale);
+  DEFINE_WEIGHT(smooth);
+  DEFINE_WEIGHT(bias);
+
+  // FP8 quantization parameters
+  DEFINE_WEIGHT(weight_scale);  // FP8 weight scale
+  DEFINE_WEIGHT(
+      input_scale);  // FP8 input (activation) scale for static quantization
+
+  // whether the input is already parallelized
+  bool input_is_parallelized_;
+
+  // whether to reduce the results
+  bool enable_result_reduction_;
+
+  // parallel process group
+  ProcessGroup* process_group_;
+
+  int64_t rank_;
+  int64_t world_size_;
+
+  // quantization args
+  QuantArgs quant_args_;
+  at::ScalarType output_dtype_;
+  LinearExtraArgs linear_extra_args_;
+};
+TORCH_MODULE(RowParallelLinear);
+
+class ReplicatedLinearImpl : public torch::nn::Module {
+ public:
+  ReplicatedLinearImpl(int64_t in_features,
+                       int64_t out_features,
+                       bool bias,
+                       const QuantArgs& quant_args,
+                       const torch::TensorOptions& options);
+
+  torch::Tensor forward(torch::Tensor input);
+
+  // load the weight from the checkpoint
+  void load_state_dict(const StateDict& state_dict);
+
+  void pretty_print(std::ostream& stream) const {
+    stream << name() << " " << weight_.sizes() << " " << weight_.device();
+  }
+
+  // return the weight (for testing)
+  torch::Tensor weight() const { return weight_; }
+
+ private:
+  // parameter members, must be registered
+  // we allocate the transpose since linear performs XA^T.
+  // A^T: [out_features, in_features]
+  DEFINE_WEIGHT(weight);
+  DEFINE_WEIGHT(bias);
+};
+TORCH_MODULE(ReplicatedLinear);
+
+}  // namespace layer
+}  // namespace janus

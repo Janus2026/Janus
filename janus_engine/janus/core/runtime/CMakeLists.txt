@@ -1,0 +1,196 @@
+include(cc_library)
+include(cc_binary)
+include(cc_test)
+
+
+cc_library(
+  NAME
+    runtime
+  HDRS
+    options.h
+    forward_params.h
+    dit_forward_params.h
+    params_utils.h
+    executor.h
+    executor_impl.h
+    executor_impl_factory.h
+    vlm_executor_impl.h
+    base_executor_impl.h
+    dit_executor.h
+    $<$<BOOL:${USE_NPU}>:acl_graph_executor_impl.h>
+    $<$<BOOL:${USE_MLU}>:mlu_graph_executor_impl.h>
+    $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.h>
+    worker.h
+    worker_impl.h
+    llm_worker_impl.h
+    vlm_worker_impl.h
+    dit_worker.h
+    embed_worker_impl.h
+    embed_vlm_worker_impl.h
+    rec_worker_impl.h
+    mm_embed_vlm_worker_impl.h
+    worker_client.h
+    xservice_client.h
+    speculative_worker_impl.h
+    mtp_worker_impl.h
+    suffix_worker_impl.h
+    eagle3_worker_impl.h
+    spec_input_builder.h
+    forward_shared_memory_manager.h
+  SRCS
+    executor.cpp
+    executor_impl_factory.cpp
+    base_executor_impl.cpp
+    vlm_executor_impl.cpp
+    dit_executor.cpp
+    $<$<BOOL:${USE_NPU}>:acl_graph_executor_impl.cpp>
+    $<$<BOOL:${USE_MLU}>:mlu_graph_executor_impl.cpp>
+    $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.cpp>
+    worker.cpp
+    worker_impl.cpp
+    llm_worker_impl.cpp
+    vlm_worker_impl.cpp
+    dit_worker.cpp
+    embed_worker_impl.cpp
+    embed_vlm_worker_impl.cpp
+    rec_worker_impl.cpp
+    mm_embed_vlm_worker_impl.cpp
+    worker_client.cpp
+    xservice_client.cpp
+    params_utils.cpp
+    speculative_worker_impl.cpp
+    mtp_worker_impl.cpp
+    suffix_worker_impl.cpp
+    eagle3_worker_impl.cpp
+    spec_input_builder.cpp
+    forward_shared_memory_manager.cpp
+  DEPS
+    torch
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    :common
+    :platform
+    :model_context
+    :request
+    :state_dict
+    :dit_cache
+    :model
+    :models
+    :sampler
+    :tokenizer
+    :model_loader
+    :util
+    :worker_service
+    :janus_server
+    $<$<BOOL:${USE_NPU}>:janus_ops>
+    $<$<BOOL:${USE_NPU}>:atb_customize>
+    $<$<BOOL:${USE_NPU}>:platform_npu>
+    :eplb
+    glog::glog
+    Folly::folly
+    absl::strings
+    absl::synchronization
+    absl::flat_hash_map
+    proto::janus_proto
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+)
+
+if(USE_NPU)
+cc_test(
+  NAME
+    acl_graph_executor_test
+  SRCS
+    acl_graph_executor_test.cpp
+  DEPS
+    :janus_server
+    :runtime
+    :model_loader
+    :batch
+    :block
+    :model
+    :models
+    :sampler
+    :kv_cache
+    GTest::gtest_main
+    torch_npu
+    atb_customize
+)
+target_link_libraries(acl_graph_executor_test
+                      PRIVATE
+                      torch_npu
+                      ascendcl
+                      hccl
+                      c_sec
+                      nnopbase
+                      )
+# Use --whole-archive for spdlog to ensure all symbols are available for janus_atb_layers
+# This resolves the undefined reference issues in janus_atb_layers
+target_link_options(acl_graph_executor_test PRIVATE
+  "-Wl,--whole-archive"
+  "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+  "-Wl,--no-whole-archive")
+endif()
+
+cc_test(
+  NAME
+    spec_input_builder_test
+  SRCS
+    spec_input_builder_test.cpp
+    spec_input_builder.cpp
+  DEPS
+    torch
+    glog::glog
+    proto::janus_proto
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    xtensor_phase_d_test
+  SRCS
+    xtensor_phase_d_test.cpp
+  DEPS
+    :runtime
+    :distributed_runtime
+    :janus_server
+    GTest::gtest_main
+)
+
+# Resolve the xtensor <-> janus_server static link cycle pulled in via
+# distributed_runtime when the regression test exercises xtensor internals.
+target_link_libraries(xtensor_phase_d_test PRIVATE
+  "$<LINK_GROUP:RESCAN,xtensor,janus_server>")
+
+if(USE_MLU)
+cc_test(
+  NAME
+    mlu_graph_executor_test
+  SRCS
+    mlu_graph_executor_test.cpp
+  DEPS
+    :runtime
+    :model_loader
+    :batch
+    :kv_cache
+    :platform
+    GTest::gtest_main
+    torch_mlu
+)
+endif()
+
+if(USE_CUDA)
+cc_test(
+  NAME
+    cuda_graph_executor_test
+  SRCS
+    cuda_graph_executor_test.cpp
+  DEPS
+    :runtime
+    :cuda_layers
+    :batch
+    :block
+    :kv_cache
+    :kernels
+    GTest::gtest_main
+    torch
+)
+endif()

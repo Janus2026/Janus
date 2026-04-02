@@ -1,0 +1,84 @@
+#include "mm_embed_vlm_worker_impl.h"
+
+#include <c10/core/DeviceGuard.h>
+#include <folly/Unit.h>
+#include <folly/futures/Future.h>
+#include <glog/logging.h>
+#include <torch/torch.h>
+
+#include <memory>
+#include <optional>
+#include <utility>
+
+#include "common/metrics.h"
+#include "framework/kv_cache/kv_cache.h"
+#include "framework/model/model_input_params.h"
+#include "framework/state_dict/state_dict.h"
+#include "models/model_registry.h"
+#include "options.h"
+#include "util/timer.h"
+
+namespace janus {
+
+MMEmbedVLMWorkerImpl::MMEmbedVLMWorkerImpl(const ParallelArgs& parallel_args,
+                                           const torch::Device& device,
+                                           const runtime::Options& options)
+    : WorkerImpl(parallel_args, device, options) {}
+
+bool MMEmbedVLMWorkerImpl::init_model(ModelContext& context) {
+  CHECK(model_ == nullptr) << "Model is already initialized.";
+
+  model_ = create_vlm_mm_embedding_model(context);
+  CHECK(model_ != nullptr) << "Failed to create model.";
+  model_executor_ = std::make_unique<Executor>(
+      model_.get(), context.get_model_args(), device_, options_);
+
+  return true;
+}
+
+std::optional<ForwardOutput> MMEmbedVLMWorkerImpl::step(
+    const ForwardInput& input) {
+  torch::DeviceGuard device_guard(device_);
+  auto ret = device_.synchronize_default_stream();
+
+  Timer timer;
+
+  // TODO remove language params in only vision model forward.
+  // TODO to adapt multi stream parallel later, just use [0] temporarily
+  // all tensors should be on the same device as model
+  auto flatten_tokens = input.token_ids.to(device_);
+  auto flatten_positions = input.positions.to(device_);
+  auto params = input.input_params.to(device_);
+  auto sampling_params = input.sampling_params.to(device_, dtype_);
+  CHECK(input.sampling_params.is_embeddings)
+      << "Only mm embedding is supported.";
+
+  // call model executor forward to get hidden states
+  MMEmbeddingVLM* em_model = dynamic_cast<MMEmbeddingVLM*>(model_.get());
+  auto encode_output = em_model->encode(params);
+  const auto it = encode_output.find("image|embedding");
+  if (it == encode_output.end() ||
+      !std::holds_alternative<std::vector<torch::Tensor>>(it->second)) {
+    LOG(ERROR) << "Invalid 'image|embedding' in encode output.";
+    return std::nullopt;
+  }
+  const auto& mm_embeddings = std::get<std::vector<torch::Tensor>>(it->second);
+
+  ret = device_.synchronize_default_stream();
+  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
+
+  if (!driver_) {
+    return std::nullopt;
+  }
+
+  // driver prepare model output
+
+  ForwardOutput output;
+  SampleOutput sample_output;
+  sample_output.mm_embeddings = mm_embeddings;
+  output.sample_output = sample_output;
+
+  return output;
+}
+
+}  // namespace janus

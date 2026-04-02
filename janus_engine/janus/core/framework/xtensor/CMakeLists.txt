@@ -1,0 +1,43 @@
+include(cc_binary)
+include(cc_library)
+
+cc_library(
+  NAME
+    xtensor
+  HDRS
+    options.h
+    phy_page.h
+    phy_page_pool.h
+    virt_page.h
+    page_allocator.h
+    global_xtensor.h
+    xtensor.h
+    xtensor_kv_layout.h
+    xtensor_allocator.h
+    xtensor_block_manager_impl.h
+    xtensor_dist_client.h
+    xtensor_dist_service.h
+    xtensor_dist_server.h
+  SRCS
+    phy_page.cpp
+    phy_page_pool.cpp
+    virt_page.cpp
+    page_allocator.cpp
+    global_xtensor.cpp
+    xtensor.cpp
+    xtensor_allocator.cpp
+    xtensor_block_manager_impl.cpp
+    xtensor_dist_client.cpp
+    xtensor_dist_service.cpp
+    xtensor_dist_server.cpp
+  DEPS
+    torch
+    :minja
+    Folly::folly
+    :common
+    mooncake_store
+    glog::glog
+    proto::janus_proto
+    :collective_service
+    :platform
+)

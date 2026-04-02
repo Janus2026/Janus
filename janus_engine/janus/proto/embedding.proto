@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package janus.proto;
+
+import "common.proto";
+import "multimodal.proto";
+import "tensor.proto";
+import "embedding_data.proto";
+
+message EmbeddingRequest {
+  // ID of the model to use. You can use the ListModels endpoint to list available models.
+  string model = 1;
+
+  // Input text to embed, encoded as a string or array of tokens. To embed multiple inputs in a single request, pass an array of strings or array of token arrays.
+  // The input must not exceed the max input tokens for the model (8192 tokens for text-embedding-ada-002),
+  // cannot be an empty string, and any array must be 2048 dimensions or less. Example Python code for counting tokens.
+  // Some models may also impose a limit on total number of tokens summed across inputs.
+  string input = 2;
+  //oneof input {
+  //  // string, The string that will be turned into an embedding.
+  //  string input_str = 2;
+  //
+  //  // array, The array of strings that will be turned into an embedding.
+  //  repeated string input_arr_str = 3;
+  //
+  //  // array, The array of integers that will be turned into an embedding.
+  //  repeated int32 input_arr_int = 4;
+  //
+  //  // array, The array of arrays containing integers that will be turned into an embedding.
+  //  repeated repeated int32 input_arr_arr_int = 5;
+  //}
+
+  // The number of dimensions the resulting output embeddings should have. Only supported in text-embedding-3 and later models.
+  optional int32 dimensions = 6;
+
+  // The format to return the embeddings in. Can be either float or base64.
+  // [default = "float"]
+  optional string encoding_format = 7;
+
+  // A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse.
+  optional string user = 8;
+
+  optional string service_request_id = 9;
+
+  optional bool add_special_tokens = 10;
+}
+
+message EmbeddingResponseData {
+  // The index of the embedding in the input array.
+  int32 index = 1;
+
+  // The object type of the embedding.
+  // [default = "embedding"]
+  string object = 2;
+
+  // The embedding vector.
+  repeated float embedding = 3;
+  repeated Embedding mm_embeddings = 4;
+  //oneof embedding {
+  //  // float, The embedding vector as an array of floats.
+  //  repeated float float_values = 3;
+  //
+  //  // string, The embedding vector as a base64 encoded string.
+  //  string base64_data = 4;
+  //}
+}
+
+message EmbeddingResponse {
+  // The ID of the embedding response.
+  string id = 1;
+
+  // The object type of the embedding response.
+  // [default = "list"]
+  string object = 2;
+
+  // The Unix timestamp of when the embedding response was created.
+  int64 created = 3;
+
+  // The model used to generate the embedding response.
+  string model = 4;
+
+  // The list of embedding response data.
+  repeated EmbeddingResponseData data = 5;
+
+  // Usage information for the embedding response.
+  Usage usage = 6;
+}
+
+message MMEmbeddingRequest {
+  // ID of the model to use. You can use the ListModels endpoint to list available models.
+  string model = 1;
+
+  repeated MMChatMessage messages = 3;
+
+  // The number of dimensions the resulting output embeddings should have. Only supported in text-embedding-3 and later models.
+  optional int32 dimensions = 6;
+
+  // The format to return the embeddings in. Can be either float or base64.
+  // [default = "float"]
+  optional string encoding_format = 7;
+
+  // A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse.
+  optional string user = 8;
+
+  optional string service_request_id = 9;
+}

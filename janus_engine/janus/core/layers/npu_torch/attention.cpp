@@ -1,0 +1,137 @@
+#include "attention.h"
+
+#include "kernels/npu/npu_ops_api.h"
+#include "kernels/ops_api.h"
+
+DECLARE_bool(enable_chunked_prefill);
+namespace janus {
+namespace layer {
+
+AttentionImpl::AttentionImpl(int64_t num_heads,
+                             int64_t head_size,
+                             float scale,
+                             int64_t num_kv_heads,
+                             int64_t sliding_window)
+    : num_heads_(num_heads),
+      head_size_(head_size),
+      num_kv_heads_(num_kv_heads),
+      sliding_window_(sliding_window),
+      scale_(scale) {
+  if (sliding_window_ > -1) {
+    sliding_window_ = sliding_window_ - 1;
+  }
+}
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>> AttentionImpl::forward(
+    const AttentionMetadata& attn_metadata,
+    torch::Tensor& query,
+    torch::Tensor& key,
+    torch::Tensor& value,
+    KVCache& kv_cache) {
+  std::optional<torch::Tensor> output_lse = std::nullopt;
+  torch::Tensor output = torch::empty_like(query);
+
+  if (attn_metadata.is_dummy) {
+    return std::make_tuple(output, output_lse);
+  }
+
+  bool only_prefill =
+      attn_metadata.is_prefill || attn_metadata.is_chunked_prefill;
+
+  torch::Tensor k_cache = kv_cache.get_k_cache();
+  torch::Tensor v = value.view({-1, num_kv_heads_, head_size_});
+  std::optional<torch::Tensor> v_cache = kv_cache.get_v_cache();
+
+  // Reshape and cache key/value
+  janus::kernel::ReshapePagedCacheParams reshape_paged_cache_params;
+  reshape_paged_cache_params.key = key.view({-1, num_kv_heads_, head_size_});
+  reshape_paged_cache_params.value = v;
+  reshape_paged_cache_params.k_cache = k_cache;
+  reshape_paged_cache_params.v_cache = v_cache;
+  reshape_paged_cache_params.slot_mapping = attn_metadata.slot_mapping;
+  janus::kernel::reshape_paged_cache(reshape_paged_cache_params);
+
+  if (only_prefill) {
+    prefill_forward(query, key, value, output, k_cache, v_cache, attn_metadata);
+  } else {
+    decoder_forward(query, output, k_cache, v_cache, attn_metadata);
+  }
+
+  output = output.view({-1, num_heads_ * head_size_});
+  return {output, output_lse};
+}
+
+void AttentionImpl::prefill_forward(torch::Tensor& query,
+                                    torch::Tensor& key,
+                                    torch::Tensor& value,
+                                    torch::Tensor& output,
+                                    const torch::Tensor& k_cache,
+                                    const std::optional<torch::Tensor>& v_cache,
+                                    const AttentionMetadata& attn_metadata) {
+  query = query.view({-1, num_heads_, head_size_});
+  output = output.view({-1, num_heads_, head_size_});
+
+  if (attn_metadata.is_prefill) {
+    key = key.view({-1, num_kv_heads_, head_size_});
+    value = value.view({-1, num_kv_heads_, head_size_});
+
+    janus::kernel::npu::batch_prefill(query,
+                                     key,
+                                     value,
+                                     attn_metadata.attn_mask,
+                                     attn_metadata.kv_seq_lens_host,
+                                     scale_,
+                                     output);
+  } else if (attn_metadata.is_chunked_prefill) {
+    janus::kernel::npu::batch_prefill(query,
+                                     k_cache,
+                                     v_cache.value(),
+                                     attn_metadata.attn_mask,
+                                     attn_metadata.kv_seq_lens_host,
+                                     scale_,
+                                     output);
+  }
+}
+
+void AttentionImpl::decoder_forward(torch::Tensor& query,
+                                    torch::Tensor& output,
+                                    const torch::Tensor& k_cache,
+                                    const std::optional<torch::Tensor>& v_cache,
+                                    const AttentionMetadata& attn_metadata) {
+  query = query.view({-1, 1, num_heads_, head_size_});
+  output = output.view({-1, 1, num_heads_, head_size_});
+
+  torch::Tensor kv_seq_lens;
+  if (attn_metadata.kv_seq_lens_host.defined()) {
+    kv_seq_lens = attn_metadata.kv_seq_lens_host;
+  } else {
+    // Fallback if host tensor isn't prepared.
+    kv_seq_lens = attn_metadata.kv_seq_lens;
+  }
+
+  if (attn_metadata.paged_attention_tiling_data.defined()) {
+    // Use CustomPagedAttention for ACL graph mode to avoid .to(kCPU) operations
+
+    janus::kernel::npu::batch_decode_acl_graph(
+        query,
+        k_cache,
+        v_cache.value_or(torch::Tensor()),
+        scale_,
+        attn_metadata.block_table,
+        kv_seq_lens,
+        attn_metadata.paged_attention_tiling_data,
+        output);
+  } else {
+    // Standard PagedAttention path
+    janus::kernel::npu::batch_decode(query,
+                                    k_cache,
+                                    v_cache.value_or(torch::Tensor()),
+                                    scale_,
+                                    attn_metadata.block_table,
+                                    kv_seq_lens,
+                                    output);
+  }
+}
+
+}  // namespace layer
+}  // namespace janus

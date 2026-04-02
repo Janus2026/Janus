@@ -1,0 +1,68 @@
+include(cc_library)
+
+cc_library(
+  NAME
+    common_layers
+  HDRS
+    qwen2_attention.h
+    qwen2_vision_attention.h
+    qwen3_next_rms_norm.h
+    partial_rotary_embedding.h
+    rms_norm_gated.h
+    rms_norm.h
+    rotary_embedding.h
+    rotary_embedding_util.h
+    $<$<NOT:$<OR:$<BOOL:${USE_ILU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_NPU}>>>:fused_moe.h>
+    dense_mlp.h
+    linear.h
+    word_embedding_impl.h
+    deep_ep.h
+    activation.h
+    attention_metadata.h
+    attention_metadata_builder.h
+    dp_utils.h
+    add_matmul.h
+    moe_fused_topk.h
+  SRCS
+    qwen2_attention.cpp
+    qwen2_vision_attention.cpp
+    qwen3_next_rms_norm.cpp
+    partial_rotary_embedding.cpp
+    rms_norm_gated.cpp
+    rms_norm.cpp
+    rotary_embedding.cpp
+    rotary_embedding_util.cpp
+    $<$<NOT:$<OR:$<BOOL:${USE_ILU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_NPU}>>>:fused_moe.cpp>
+    dense_mlp.cpp
+    linear.cpp
+    word_embedding_impl.cpp
+    deep_ep.cpp
+    activation.cpp
+    attention_metadata_builder.cpp
+    dp_utils.cpp
+    add_matmul.cpp
+    moe_fused_topk.cpp
+  DEPS
+    "-Wl,--whole-archive"
+    "-Wl,--no-whole-archive"
+    :kv_cache
+    :prefix_cache
+    :block
+    :parallel_state
+    :state_dict
+    :model
+    :kernels
+    glog::glog
+    gflags::gflags
+    torch
+    :platform
+    $<$<BOOL:${USE_MLU}>:mlu_layers>
+    $<$<BOOL:${USE_CUDA}>:cuda_layers>
+    $<$<BOOL:${USE_ILU}>:ilu_layers>
+    $<$<BOOL:${USE_NPU}>:npu_torch_layers>
+    $<$<BOOL:${USE_MUSA}>:musa_layers>
+)
+
+if(USE_MLU)
+  add_subdirectory(tests)
+endif()

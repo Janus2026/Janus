@@ -1,0 +1,270 @@
+#pragma once
+
+#include <torch/torch.h>
+
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <string>
+
+#include "common/types.h"
+#include "framework/model/model_input_params.h"
+#include "framework/request/mm_batch_data.h"
+#include "framework/request/mm_data.h"
+#include "framework/sampling/beam_searcher.h"
+#include "framework/sampling/sampling_params.h"
+#include "platform/device.h"
+
+namespace janus {
+
+class WorkerType {
+ public:
+  enum Value : int8_t {
+    INVALID = 0,
+    LLM,     // LLM
+    VLM,     // VLM
+    DIT,     // DIT
+    ELM,     // Embedding LM
+    EVLM,    // Embedding VLM
+    REC,     // Rec
+    MMEVLM,  // Encoder Embedding VLM
+  };
+
+  constexpr WorkerType(Value v) : value_(v) {}
+  WorkerType(const std::string& str) {
+    if (str == "LLM") {
+      value_ = LLM;
+    } else if (str == "VLM") {
+      value_ = VLM;
+    } else if (str == "DIT") {
+      value_ = DIT;
+    } else if (str == "ELM") {
+      value_ = ELM;
+    } else if (str == "EVLM") {
+      value_ = EVLM;
+    } else if (str == "REC") {
+      value_ = REC;
+    } else if (str == "MMEVLM") {
+      value_ = MMEVLM;
+    } else {
+      value_ = INVALID;
+    }
+  }
+
+  WorkerType() = delete;
+
+  constexpr operator Value() const { return value_; }
+  explicit operator bool() = delete;
+
+  bool operator==(WorkerType rhs) const { return value_ == rhs.value_; }
+  bool operator!=(WorkerType rhs) const { return value_ != rhs.value_; }
+  bool operator==(Value rhs) const { return value_ == rhs; }
+  bool operator!=(Value rhs) const { return value_ != rhs; }
+
+  constexpr const char* to_string() const {
+    if (this->value_ == LLM) {
+      return "LLM";
+    } else if (this->value_ == VLM) {
+      return "VLM";
+    } else if (this->value_ == DIT) {
+      return "DIT";
+    } else if (this->value_ == ELM) {
+      return "ELM";
+    } else if (this->value_ == EVLM) {
+      return "EVLM";
+    } else if (this->value_ == REC) {
+      return "REC";
+    } else if (this->value_ == MMEVLM) {
+      return "MMEVLM";
+    } else {
+      return "INVALID";
+    }
+  }
+
+ private:
+  Value value_;
+};
+
+// Step-level decode metadata for Rec multi-round (device loop).
+struct StepDecodeMeta {
+  int32_t batch_size = 0;
+  int32_t beam_width = 1;
+  int32_t current_round = 0;
+  int32_t total_round = 0;
+  // Planned decode kv cache shape: [batch_size * beam_width, n_kv_heads,
+  // step_rounds, head_dim]
+  std::vector<int64_t> full_kv_shape;
+  // Flattened decode positions for each sequence.
+  std::vector<int32_t> decode_positions_vec;
+};
+
+// Inputs for forward execution
+struct ForwardInput {
+  ForwardInput to(const torch::Device& device, torch::ScalarType dtype) const {
+    ForwardInput inputs;
+    inputs.token_ids = safe_to(token_ids, device, true);
+    inputs.positions = safe_to(positions, device, true);
+    // Convert positions to int64 on CUDA/ILU/MUSA to avoid repeated per-layer
+    // type conversions in rope kernels.
+    const auto dev = Device::type_str();
+    if ((dev == "cuda" || dev == "ilu" || dev == "musa") &&
+        inputs.positions.defined() &&
+        inputs.positions.scalar_type() != torch::kInt64) {
+      inputs.positions = inputs.positions.to(torch::kInt64);
+    }
+    inputs.input_params = input_params.to(device);
+    inputs.sampling_params = sampling_params.to(device, dtype);
+    inputs.decoder_sampling_params = decoder_sampling_params.to(device, dtype);
+    inputs.transfer_kv_infos = transfer_kv_infos;
+    inputs.eplb_info = eplb_info;
+    inputs.acc_logprob = safe_to(acc_logprob, device, true);
+    inputs.step_decode = step_decode;
+    inputs.skip_sampling_for_logits_only = skip_sampling_for_logits_only;
+    inputs.device_input_buffer = device_input_buffer;
+    return inputs;
+  }
+
+  void print() const {
+    LOG(INFO) << "  token_ids: " << token_ids << std::endl;
+    LOG(INFO) << "  positions: " << positions << std::endl;
+    input_params.print();
+    LOG(INFO) << " params.selected_token_idxes "
+              << sampling_params.selected_token_idxes;
+    LOG(INFO) << " params.sample_idxes " << sampling_params.sample_idxes;
+    LOG(INFO) << " params.do_sample " << sampling_params.do_sample;
+  }
+
+  const StepDecodeMeta* step_meta() const {
+    return step_decode ? &(*step_decode) : nullptr;
+  }
+
+  bool has_step_meta() const { return step_decode.has_value(); }
+
+  // flatten token ids
+  torch::Tensor token_ids;
+  // flatten positions
+  torch::Tensor positions;
+  ModelInputParams input_params;
+  SamplingParameters sampling_params;
+  SamplingParameters decoder_sampling_params;
+  // beam search kernel input
+  torch::Tensor acc_logprob;
+
+  // step-level decode metadata
+  std::optional<StepDecodeMeta> step_decode;
+  // If true, skip sampler forward and only keep logits.
+  bool skip_sampling_for_logits_only = false;
+
+  // kv info for disaggregated prefill/decode
+  std::vector<TransferKVInfo> transfer_kv_infos;
+  EplbInfo eplb_info;
+
+  // A tensor used to store all device-side input data, with other input tensors
+  // constructed based on the address and offset of this tensor.
+  torch::Tensor device_input_buffer;
+};
+
+// output after forward execution
+struct ForwardOutput {
+  // sample parameters for speculative decoding
+  torch::Tensor do_sample;
+  // whether to return logprobs
+  bool logprobs = false;
+  // max number of top logprobs in the batch
+  int64_t max_top_logprobs = 0;
+  SampleOutput sample_output;
+  torch::Tensor logits;
+  torch::Tensor embedding;
+
+  // for eplb, collect the tokens load of experts on each worker.
+  torch::Tensor expert_load_data;
+  // for eplb, indicates that the specified layer on the worker
+  // has completed the asynchronous loading of new weight.
+  int32_t prepared_layer_id;
+
+  BeamSearchOutput beam_search_output;
+  torch::Tensor beam_sequence_group;
+};
+
+// Model input with raw data, which will be
+// serielize to pb type before pass to remote worker.
+struct RawForwardInput {
+  std::vector<int32_t> flatten_tokens_vec;
+  std::vector<int32_t> flatten_positions_vec;
+  std::vector<std::vector<int32_t>> m_positions_vec;
+  std::vector<const RequestSamplingParam*> sampling_params;
+  std::vector<int32_t> selected_token_idxes;
+  std::vector<int32_t> sample_idxes;
+  std::vector<std::vector<int64_t>> unique_token_ids_vec;
+  std::vector<std::vector<int32_t>> unique_token_counts_vec;
+  std::vector<int32_t> unique_token_lens_vec;
+  BatchForwardType batch_forward_type;
+  uint32_t max_seq_len;
+  uint32_t q_max_seq_len;
+  std::vector<int32_t> seq_lens;
+  std::vector<int32_t> q_seq_lens;
+  std::vector<int32_t> q_cu_seq_lens;
+  std::vector<int32_t> kv_cache_tokens_nums;
+  std::vector<int32_t> new_token_slot_ids;
+  std::vector<std::vector<int32_t>> block_tables_vec;
+  int32_t num_sequences;
+  // num tokens of all workers，mainly used for dp case
+  std::vector<int32_t> dp_global_token_nums;
+  std::vector<int32_t> dp_is_decode;
+  // kv info for disaggregated prefill/decode
+  std::vector<TransferKVInfo> transfer_kv_infos;
+  EplbInfo eplb_info;
+  std::vector<std::vector<float>> embeddings;
+  // chunked prefill case of speculative decoding
+  // extra token ids for each sequence, and -1 for last chunk
+  std::vector<int32_t> extra_token_ids;
+  // embedding ids of each sequence
+  std::vector<int> embedding_ids;
+  // request ids of each sequence
+  std::vector<std::string> request_ids;
+  // swap
+  std::vector<BlockTransferInfo> swap_blocks;
+  uint64_t batch_id;
+  // block copy kernel
+  std::vector<int32_t> src_block_indices;
+  std::vector<int32_t> dst_block_indices;
+  std::vector<int32_t> cum_sum;
+  // for continuous kvcache
+  std::vector<int64_t> new_cache_slot_offsets;  //[n_tokens]
+  std::vector<int64_t> kv_cache_start_offsets;  //[n_seq]
+  // beam search kernel input
+  std::vector<float> acc_logprob_vec;
+  // for flashinfer
+  std::vector<int32_t> paged_kv_indptr;         //[n_seq + 1]
+  std::vector<int32_t> paged_kv_indices;        //[num_used_pages]
+  std::vector<int32_t> paged_kv_last_page_len;  //[n_seq]
+  // multimodal data
+  MMBatchData mm_data;
+};
+
+struct RawSampleOutput {
+  std::vector<RawToken> tokens;  // num tokens
+};
+
+struct RawForwardOutput {
+  std::vector<RawSampleOutput> outputs;  // num seqs
+  std::vector<int64_t> expert_load_data;
+  int32_t prepared_layer_id;
+  // beam search kernel output
+  std::vector<int32_t> src_seq_idxes;
+  std::vector<int32_t> out_tokens;
+  std::vector<float> out_logprobs;
+
+  // batch-level beam output for Rec multi-round mode
+  std::vector<int32_t> beam_sequence_group;  // flattened 2D
+  // multimodal embedding output
+  std::vector<torch::Tensor> mm_embeddings;
+};
+
+struct BatchedForwardInputs {
+  std::vector<ForwardInput> micro_inputs;
+  SamplingParameters concated_sampling_params;
+  // beam search kernel input
+  torch::Tensor acc_logprob;
+};
+
+}  // namespace janus

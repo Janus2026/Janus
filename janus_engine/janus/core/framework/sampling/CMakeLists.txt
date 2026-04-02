@@ -1,0 +1,55 @@
+include(cc_library)
+include(cc_test)
+
+cc_library(
+  NAME 
+    sampler
+  HDRS
+    sampling_params.h
+    logits_utils.h
+    rejection_sampler.h
+    sampler.h
+    rec_sampler.h
+    beam_searcher.h
+    rec_constrained_decoding.h
+  SRCS
+    sampling_params.cpp
+    logits_utils.cpp
+    rejection_sampler.cpp
+    sampler.cpp
+    rec_sampler.cpp
+    beam_searcher.cpp
+    rec_constrained_decoding.cpp
+  DEPS
+    :state_dict
+    :common
+    glog::glog
+    torch
+    :kernels
+    $<$<BOOL:${USE_NPU}>:janus_ops>
+)
+
+cc_test(
+  NAME
+    sampler_test
+  SRCS
+    rejection_sampler_test.cpp
+    rejection_sampler.cpp
+    sampling_params_test.cpp
+  DEPS
+    absl::strings
+    GTest::gtest_main
+    :flags
+    :sampler
+    glog::glog
+    :state_dict
+)
+target_link_libraries(sampler_test PRIVATE brpc OpenSSL::SSL OpenSSL::Crypto leveldb::leveldb protobuf::libprotobuf)
+target_link_libraries(sampler_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+add_dependencies(sampler_test brpc-static)

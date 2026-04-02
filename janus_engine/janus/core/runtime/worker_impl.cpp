@@ -1,0 +1,1136 @@
+#include "worker_impl.h"
+
+#include <ATen/Parallel.h>
+#include <folly/Unit.h>
+#include <folly/futures/Future.h>
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <torch/torch.h>
+#if defined(USE_NPU)
+#include "acl/acl.h"
+#include "kernels/npu/janus_ops/janus_ops_api.h"
+#elif defined(USE_MLU)
+#include <framework/core/caching_allocator.h>
+#elif defined(USE_CUDA) || defined(USE_ILU)
+#include <c10/cuda/CUDACachingAllocator.h>
+#endif
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+
+#include "common/device_monitor.h"
+#include "common/global_flags.h"
+#include "common/metrics.h"
+#if defined(USE_NPU)
+#include "platform/npu/device_capture_lock.h"
+#endif
+#include "core/distributed_runtime/master.h"
+#include "framework/kv_cache/kv_cache.h"
+#include "framework/model/model_input_params.h"
+#include "framework/model_loader.h"
+#include "framework/sampling/sampler.h"
+#include "framework/state_dict/state_dict.h"
+#include "framework/xtensor/global_xtensor.h"
+#include "framework/xtensor/xtensor_allocator.h"
+#if defined(USE_NPU)
+#include "framework/kv_cache/mooncake_weight_transfer.h"
+#include "layers/npu/loader/rolling_weight_buffer.h"
+#endif
+#include "util/net.h"
+#include "util/tensor_helper.h"
+#include "util/threadpool.h"
+#include "util/timer.h"
+#include "util/utils.h"
+
+#define USE_ASYNC true
+
+namespace janus {
+
+constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
+constexpr uint32_t BATCH_COPY_MAX_SIZE = 4096;
+constexpr uint32_t TIMEOUT_S = 60;      // second
+constexpr uint32_t TIMEOUT_MS = 60000;  // millisecond
+
+namespace {
+
+// During TP model initialization, each rank loads weights concurrently.
+// MoE weight assembly (especially stack/cat on large expert tensors) runs on
+// CPU and is backed by ATen intra-op thread pools.
+//
+// If every TP rank also uses many intra-op threads, we get severe CPU
+// oversubscription and memory-bandwidth contention:
+//   1) many processes run large stack/cat at the same time
+//   2) each process fans out into multiple CPU workers
+//   3) host-side contention dominates load time even when I/O is fast
+//
+// For the weight-loading window only, forcing ATen to 1 thread reduces this
+// cross-rank contention and usually lowers end-to-end load latency in TP mode.
+// We restore the previous thread count immediately after load_model() returns,
+// so runtime compute behavior remains unchanged.
+class ScopedAtenLoadThreads {
+ public:
+  explicit ScopedAtenLoadThreads(int32_t target_threads)
+      : prev_threads_(at::get_num_threads()) {
+    if (target_threads > 0 && prev_threads_ != target_threads) {
+      torch::set_num_threads(target_threads);
+      active_ = true;
+    }
+  }
+
+  ~ScopedAtenLoadThreads() {
+    if (active_) {
+      torch::set_num_threads(prev_threads_);
+    }
+  }
+
+  // Non-copyable and non-movable
+  ScopedAtenLoadThreads(const ScopedAtenLoadThreads&) = delete;
+  ScopedAtenLoadThreads& operator=(const ScopedAtenLoadThreads&) = delete;
+  ScopedAtenLoadThreads(ScopedAtenLoadThreads&&) = delete;
+  ScopedAtenLoadThreads& operator=(ScopedAtenLoadThreads&&) = delete;
+
+ private:
+  int32_t prev_threads_ = 0;
+  bool active_ = false;
+};
+
+}  // namespace
+
+WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
+                       const torch::Device& device,
+                       const runtime::Options& options)
+    : options_(options), device_(device), parallel_args_(parallel_args) {
+  if (options_.enable_speculative_decode() &&
+      options_.num_decoding_tokens() == 1) {
+    is_spec_draft_ = true;
+  }
+
+  // first worker is the driver
+  driver_ = parallel_args.rank() == 0;
+  int32_t tp_size = parallel_args.world_size() / parallel_args.dp_size();
+  dp_driver_ =
+      parallel_args.dp_size() > 1 && parallel_args.rank() % tp_size == 0;
+
+  device_.set_device();
+  device_.init_device_context();
+  threadpool_.schedule([this]() mutable { device_.set_device(); });
+  prepare_stream_ = device_.get_stream_from_pool();
+  compute_stream_ = device_.get_stream_from_pool();
+  sampler_ = std::make_unique<Sampler>();
+
+#if !defined(USE_NPU)
+  // Startup validation: ATB block-copy kernel is NPU-only. We should fail fast
+  // if CUDA deployment accidentally enables it.
+  CHECK(!FLAGS_enable_block_copy_kernel)
+      << "enable_block_copy_kernel must be false on CUDA builds.";
+#endif
+
+#if defined(USE_NPU)
+  if (FLAGS_enable_xtensor) {
+    if (!weight_transfer_) {
+      weight_transfer_ = std::make_unique<MooncakeWeightTransfer>(
+          options_.transfer_listen_port(), device_.unwrap());
+    }
+    if (!weight_transfer_->initialize()) {
+      LOG(ERROR) << "Failed to initialize MooncakeWeightTransfer";
+    }
+    if (!weight_transfer_->register_global_xtensor()) {
+      LOG(ERROR) << "Failed to register GlobalXTensor";
+    }
+  }
+  if (FLAGS_enable_rolling_load) {
+    load_stream_ = device_.get_stream_from_pool();
+  }
+#endif
+}
+
+WorkerImpl::~WorkerImpl() = default;
+
+bool WorkerImpl::allocate_kv_cache(
+    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  CHECK(kv_caches_.empty()) << "KV caches are already initialized.";
+  const bool enable_linear_attention =
+      context_.get_model_args().full_attention_interval() > 1;
+  const bool enable_lighting_indexer =
+      context_.get_model_args().index_n_heads() > 0;
+  CHECK(!(enable_linear_attention && enable_lighting_indexer))
+      << "KVCache does not support linear attention and lighting indexer "
+      << "simultaneously.";
+
+  // Check if KV cache quantization is enabled
+  // "auto" (default): cache dtype aligns with model dtype (no quantization)
+  // "int8": enables INT8 quantization
+  const bool enable_kv_cache_quant = options_.kv_cache_dtype() == "int8";
+
+  if (enable_kv_cache_quant) {
+#if !defined(USE_MLU)
+    LOG(FATAL) << "KV Cache quantization is only supported on MLU backend. "
+               << "Current backend does not support this feature.";
+#endif
+    // Check for unsupported scenarios
+    if (options_.backend() == "vlm") {
+      LOG(FATAL) << "KV Cache quantization is not supported for VLM "
+                    "(Vision-Language Model) backend.";
+    }
+    if (options_.enable_disagg_pd()) {
+      LOG(FATAL) << "KV Cache quantization is not supported in PD "
+                    "disaggregation mode.";
+    }
+  }
+
+  // create a KVCache for each layer
+  const int64_t num_layers = get_num_layers();
+  kv_caches_.reserve(num_layers);
+
+  if (FLAGS_enable_xtensor) {
+    // XTensor mode: create xtensor-backed KV cache tensors.
+    auto& allocator = XTensorAllocator::get_instance();
+    const std::string& model_id = options_.model_id();
+    // Create K tensors for all layers
+    auto k_tensors = allocator.create_k_tensors(
+        model_id, kv_cache_shape[0], dtype_, num_layers);
+    // Create V tensors for all layers
+    auto v_tensors = allocator.create_v_tensors(
+        model_id, kv_cache_shape[1], dtype_, num_layers);
+    std::vector<torch::Tensor> index_tensors;
+    if (enable_lighting_indexer) {
+      index_tensors = allocator.create_index_tensors(
+          model_id, kv_cache_shape[2], dtype_, num_layers);
+    }
+
+    for (int64_t i = 0; i < num_layers; ++i) {
+      auto k_tensor = k_tensors[i];
+      auto v_tensor = v_tensors[i];
+      torch::Tensor index_tensor;
+#if defined(USE_NPU)
+      k_tensor = at_npu::native::npu_format_cast(k_tensor, ACL_FORMAT_ND);
+      v_tensor = at_npu::native::npu_format_cast(v_tensor, ACL_FORMAT_ND);
+      if (enable_lighting_indexer) {
+        index_tensor =
+            at_npu::native::npu_format_cast(index_tensors[i], ACL_FORMAT_ND);
+      }
+#else
+      if (enable_lighting_indexer) {
+        index_tensor = index_tensors[i];
+      }
+#endif
+      if (enable_lighting_indexer) {
+        kv_caches_.emplace_back(k_tensor, v_tensor, index_tensor);
+      } else {
+        kv_caches_.emplace_back(k_tensor, v_tensor);
+      }
+    }
+  } else {
+    // Original mode: create torch tensors with optional int8 kv quantization.
+    torch::ScalarType cache_dtype =
+        enable_kv_cache_quant ? torch::kInt8 : dtype_;
+    for (int64_t i = 0; i < num_layers; ++i) {
+      torch::Tensor key_cache, value_cache, index_cache, conv_cache, ssm_cache;
+      torch::Tensor key_cache_scale, value_cache_scale;
+#if defined(USE_NPU)
+      aclFormat npu_format_type =
+          context_.get_model_args().model_type() == "deepseek_v3" &&
+                  FLAGS_enable_prefix_cache
+              ? ACL_FORMAT_FRACTAL_NZ
+              : ACL_FORMAT_ND;
+      key_cache = at_npu::native::npu_format_cast(
+          torch::empty(kv_cache_shape[0],
+                       torch::dtype(cache_dtype).device(device_)),
+          npu_format_type);
+      value_cache = at_npu::native::npu_format_cast(
+          torch::empty(kv_cache_shape[1],
+                       torch::dtype(cache_dtype).device(device_)),
+          npu_format_type);
+      if (enable_lighting_indexer) {
+        index_cache = at_npu::native::npu_format_cast(
+            torch::empty(kv_cache_shape[2],
+                         torch::dtype(dtype_).device(device_)),
+            npu_format_type);
+      }
+      if (enable_linear_attention) {
+        conv_cache = at_npu::native::npu_format_cast(
+            torch::zeros(kv_cache_shape[2],
+                         torch::dtype(dtype_).device(device_)),
+            2);
+        ssm_cache = at_npu::native::npu_format_cast(
+            torch::zeros(kv_cache_shape[3],
+                         torch::dtype(dtype_).device(device_)),
+            2);
+      }
+#elif defined(USE_ILU) || defined(USE_MLU) || defined(USE_MUSA)
+      key_cache = torch::zeros(kv_cache_shape[0],
+                               torch::dtype(cache_dtype).device(device_));
+      if (!kv_cache_shape[1].empty()) {
+        value_cache = torch::zeros(kv_cache_shape[1],
+                                   torch::dtype(cache_dtype).device(device_));
+      }
+      if (enable_lighting_indexer) {
+        index_cache = torch::zeros(kv_cache_shape[2],
+                                   torch::dtype(dtype_).device(device_));
+      }
+      if (enable_kv_cache_quant) {
+        std::vector<int64_t> key_scale_shape(kv_cache_shape[0].begin(),
+                                             kv_cache_shape[0].end() - 1);
+        key_cache_scale = torch::zeros(
+            key_scale_shape, torch::dtype(torch::kFloat32).device(device_));
+        if (!kv_cache_shape[1].empty()) {
+          std::vector<int64_t> value_scale_shape(kv_cache_shape[1].begin(),
+                                                 kv_cache_shape[1].end() - 1);
+          value_cache_scale = torch::zeros(
+              value_scale_shape, torch::dtype(torch::kFloat32).device(device_));
+        }
+      }
+#else
+      key_cache = torch::empty(kv_cache_shape[0],
+                               torch::dtype(cache_dtype).device(device_));
+      if (!kv_cache_shape[1].empty()) {
+        value_cache = torch::empty(kv_cache_shape[1],
+                                   torch::dtype(cache_dtype).device(device_));
+      }
+      if (enable_lighting_indexer) {
+        index_cache = torch::empty(kv_cache_shape[2],
+                                   torch::dtype(dtype_).device(device_));
+      }
+#endif
+      if (enable_kv_cache_quant) {
+        kv_caches_.emplace_back(key_cache,
+                                value_cache,
+                                index_cache,
+                                key_cache_scale,
+                                value_cache_scale);
+      } else if (enable_linear_attention) {
+        kv_caches_.emplace_back(key_cache, value_cache, conv_cache, ssm_cache);
+      } else if (enable_lighting_indexer) {
+        kv_caches_.emplace_back(key_cache, value_cache, index_cache);
+      } else {
+        kv_caches_.emplace_back(key_cache, value_cache);
+      }
+    }
+  }
+
+  init_hierarchy_kv_cache_transfer();
+  status_ = Status::READY;
+  return true;
+}
+
+bool WorkerImpl::allocate_kv_cache_with_transfer(
+    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  CHECK(kv_caches_.empty()) << "KV caches are already initialized.";
+
+  int32_t device_id = device_.index();
+  // create a KVCache for each layer
+  const int64_t num_layers = context_.get_model_args().n_layers();
+  const bool enable_lighting_indexer =
+      context_.get_model_args().index_n_heads() > 0;
+  kv_cache_transfer_ = KVCacheTransferFactory::create(
+      FLAGS_kv_cache_transfer_type,
+      options_.device_ip().value(),
+      options_.transfer_listen_port(),
+      options_.instance_role(),
+      device_,
+      kv_cache_shape,
+      dtype_,
+      kv_caches_,
+      num_layers,
+      [this](const std::vector<std::vector<int64_t>>& shape) {
+        this->allocate_kv_cache(shape);
+      },
+      enable_lighting_indexer,
+      context_.get_model_args().model_type(),
+      options_.model_id());
+
+  init_hierarchy_kv_cache_transfer();
+
+  status_ = Status::READY;
+  return true;
+}
+
+#if defined(USE_NPU)
+bool WorkerImpl::allocate_kv_cache_with_transfer(
+    std::shared_ptr<KVCacheTransfer> kv_cache_transfer,
+    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  CHECK(kv_caches_.empty()) << "KV caches are already initialized.";
+
+  kv_cache_transfer_ = kv_cache_transfer;
+
+  // create a KVCache for each layer
+  const int64_t num_layers = context_.get_model_args().n_layers();
+  kv_caches_.reserve(num_layers);
+  if (is_spec_draft_) {
+    kv_cache_transfer_->allocate_kv_cache_spec(
+        kv_caches_, num_layers, kv_cache_shape, dtype_);
+  } else {
+    kv_cache_transfer_->allocate_kv_cache(
+        kv_caches_, num_layers, kv_cache_shape, dtype_);
+  }
+
+  init_hierarchy_kv_cache_transfer();
+  status_ = Status::READY;
+  return true;
+}
+#endif
+
+void WorkerImpl::get_device_info(std::string& device_ip, uint16_t& port) {
+  // device_ip = options_.device_ip().value();
+  device_ip = net::get_local_ip_addr();
+  port = options_.transfer_listen_port();
+}
+
+void WorkerImpl::get_p2p_addr(std::string& p2p_addr) {
+#if defined(USE_NPU)
+  auto& core = MooncakeTransferEngineCore::get_instance();
+  if (core.is_initialized()) {
+    p2p_addr = core.addr();
+  }
+#endif
+}
+
+void WorkerImpl::get_cache_info(uint64_t& cluster_id,
+                                std::string& addr,
+                                int64_t& k_cache_id,
+                                int64_t& v_cache_id) {
+#if defined(USE_NPU)
+  kv_cache_transfer_->get_cache_info(cluster_id, addr, k_cache_id, v_cache_id);
+#endif
+}
+
+bool WorkerImpl::link_cluster(const std::vector<uint64_t>& cluster_ids,
+                              const std::vector<std::string>& addrs,
+                              const std::vector<std::string>& device_ips,
+                              const std::vector<uint16_t>& ports) {
+#if defined(USE_NPU)
+  for (int32_t i = 0; i < cluster_ids.size(); ++i) {
+    if (!kv_cache_transfer_->link_cluster(
+            cluster_ids[i], addrs[i], device_ips[i], ports[i])) {
+      return false;
+    }
+  }
+#endif
+  return true;
+}
+
+bool WorkerImpl::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
+                                const std::vector<std::string>& addrs,
+                                const std::vector<std::string>& device_ips,
+                                const std::vector<uint16_t>& ports) {
+#if defined(USE_NPU)
+  for (int32_t i = 0; i < cluster_ids.size(); ++i) {
+    if (!kv_cache_transfer_->unlink_cluster(
+            cluster_ids[i], addrs[i], device_ips[i], ports[i])) {
+      return false;
+    }
+  }
+#endif
+  return true;
+}
+
+bool WorkerImpl::link_d2d(const std::string& remote_addr) {
+#if defined(USE_NPU)
+  if (!weight_transfer_) {
+    LOG(ERROR) << "MooncakeWeightTransfer not initialized";
+    return false;
+  }
+  return weight_transfer_->link_d2d(remote_addr);
+#else
+  LOG(ERROR) << "link_d2d requires USE_NPU build";
+  return false;
+#endif
+}
+
+bool WorkerImpl::unlink_d2d(const std::string& remote_addr) {
+#if defined(USE_NPU)
+  if (!weight_transfer_) {
+    LOG(ERROR) << "MooncakeWeightTransfer not initialized";
+    return false;
+  }
+  return weight_transfer_->unlink_d2d(remote_addr);
+#else
+  LOG(ERROR) << "unlink_d2d requires USE_NPU build";
+  return false;
+#endif
+}
+
+std::tuple<int64_t, int64_t> WorkerImpl::estimate_kv_cache_capacity() {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  size_t torch_cache = 0;
+  size_t torch_largest_block = 0;
+  int32_t device_id = device_.index();
+  Device::empty_cache(device_id);
+#if defined(USE_NPU)
+  // get torch's cache memory size
+  c10_npu::NPUCachingAllocator::cacheInfo(
+      device_id, &torch_cache, &torch_largest_block);
+#endif
+  const auto available_memory = device_.free_memory();
+  const auto total_memory = device_.total_memory();
+  DeviceMonitor::get_instance().set_total_memory(device_id, total_memory);
+  DeviceMonitor::get_instance().set_weight_memory(
+      device_id, total_memory - available_memory - torch_cache);
+  return {available_memory + torch_cache, total_memory};
+}
+
+void WorkerImpl::process_group_test() {
+  device_.set_device();
+
+  // create random tensors
+  const auto options = torch::dtype(torch::kHalf).device(device_);
+  torch::Tensor tensor = torch::randn({10, 10}, options);
+  // call allreduce
+  parallel_state::reduce(tensor, parallel_args_.process_group_);
+  // call allgather
+  parallel_state::gather(tensor, parallel_args_.process_group_);
+}
+
+ForwardInput WorkerImpl::prepare_inputs(Batch& batch) {
+  return model_executor_->prepare_inputs(batch);
+}
+
+folly::SemiFuture<std::tuple<int64_t, int64_t>>
+WorkerImpl::estimate_kv_cache_capacity_async() {
+  folly::Promise<std::tuple<int64_t, int64_t>> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this, promise = std::move(promise)]() mutable {
+    const auto output = this->estimate_kv_cache_capacity();
+    promise.setValue(output);
+  });
+  return future;
+}
+
+void WorkerImpl::update_last_step_output(
+    const std::optional<ForwardOutput>& output) {
+  if (output.value().sample_output.next_tokens.defined()) {
+    last_step_output_ = std::move(output.value());
+    last_step_output_valid_ = true;
+  } else {
+    if (FLAGS_enable_eplb) {
+      last_step_output_ = std::move(output.value());
+    }
+    last_step_output_valid_ = false;
+  }
+}
+
+ForwardInput WorkerImpl::update_input_by_last_step_output(
+    ForwardInput& inputs) {
+#if defined(USE_NPU)
+  janus::kernel::npu::replace_token(inputs.token_ids,
+                                   last_step_output_.sample_output.next_tokens);
+#else
+  auto& flatten_tokens = inputs.token_ids;
+  auto neg_mask = (flatten_tokens < 0);
+  auto clamped_neg_indices = torch::clamp(-flatten_tokens, 0);
+#if defined(USE_MUSA)
+  auto cpu = clamped_neg_indices.cpu() - 1;
+  auto replacement =
+      last_step_output_.sample_output.next_tokens.index({cpu.musa()});
+#else
+  auto replacement = last_step_output_.sample_output.next_tokens.index(
+      {clamped_neg_indices - 1});
+#endif
+  inputs.token_ids = torch::where(neg_mask, replacement, flatten_tokens);
+#endif
+  return inputs;
+}
+
+void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
+                                             ForwardInput& processed_input) {
+  JANUS_DLOG(INFO) << "[DIAG-WI] prepare_work_before_execute entered";
+#if defined(USE_NPU)
+  std::optional<std::unique_lock<std::mutex>> lock_guard;
+  if (FLAGS_enable_graph) {
+    JANUS_DLOG(INFO) << "[DIAG-WI] acquiring DeviceCaptureLock";
+    auto& capture_lock =
+        ::janus::npu::DeviceCaptureLock::get_instance().get_lock(
+            device_.index());
+    lock_guard.emplace(capture_lock);
+    JANUS_DLOG(INFO) << "[DIAG-WI] DeviceCaptureLock acquired";
+  }
+#endif
+  c10::StreamGuard streamGuard = prepare_stream_->set_stream_guard();
+
+  JANUS_DLOG(INFO) << "[DIAG-WI] input.to(device) starting";
+  processed_input = input.to(device_, dtype_);
+  JANUS_DLOG(INFO) << "[DIAG-WI] input.to(device) done";
+  auto& input_params = processed_input.input_params;
+
+#if defined(USE_NPU)
+  const bool use_block_copy_kernel = FLAGS_enable_block_copy_kernel;
+#else
+  const bool use_block_copy_kernel = false;
+#endif
+
+#if defined(USE_NPU) || defined(USE_CUDA)
+  if (input_params.swap_blocks.size() > 0 && !use_block_copy_kernel) {
+    auto& swap_blocks = input_params.swap_blocks;
+
+    // collect src and dst indices
+    std::vector<int64_t> src_indices, dst_indices;
+    src_indices.reserve(swap_blocks.size());
+    dst_indices.reserve(swap_blocks.size());
+
+    for (const auto& block : swap_blocks) {
+      src_indices.push_back(block.src_block_id);
+      dst_indices.push_back(block.dst_block_id);
+    }
+
+    // batch select keys and values
+    auto src_tensor =
+        torch::tensor(src_indices, torch::dtype(torch::kLong).device(device_));
+    auto dst_tensor =
+        torch::tensor(dst_indices, torch::dtype(torch::kLong).device(device_));
+    const int64_t num_layers = context_.get_model_args().n_layers();
+    for (int32_t layer_id = 0; layer_id < num_layers; layer_id++) {
+      kv_caches_[layer_id].swap_blocks(src_tensor, dst_tensor);
+    }
+  }
+#endif
+
+#if defined(USE_NPU)
+  if (FLAGS_enable_mla &&
+      input_params.batch_forward_type.is_chunked_prefill()) {
+    prepare_mla_prefixcache_inputs(input_params);
+  }
+
+  if (!context_.get_parallel_args().mapping_data().empty() &&
+      (context_.get_parallel_args().dp_size() > 1 ||
+       context_.get_parallel_args().ep_size() > 1)) {
+    torch::Tensor token_size_per_dp_group =
+        torch::tensor(processed_input.input_params.dp_global_token_nums,
+                      torch::TensorOptions()
+                          .device(torch::kCPU)
+                          .dtype(torch::kInt32)
+                          .pinned_memory(true));
+    bool is_prefill =
+        processed_input.input_params.batch_forward_type.is_prefill();
+    DpEpPadding dp_ep_padding(token_size_per_dp_group,
+                              context_.get_model_args().num_experts_per_tok(),
+                              context_.get_parallel_args().mapping_data(),
+                              device_,
+                              dtype_,
+                              is_prefill);
+    processed_input.input_params.dp_ep_padding_data = dp_ep_padding.build();
+    if (FLAGS_enable_eplb) {
+      // expert_load_data_.fill_(0);
+      processed_input.input_params.expert_load_data = expert_load_data_;
+    }
+  }
+#endif
+
+  JANUS_DLOG(INFO) << "[DIAG-WI] prepare_stream synchronize starting";
+  auto ret = prepare_stream_->synchronize();
+  JANUS_DLOG(INFO) << "[DIAG-WI] prepare_stream synchronize done, ret=" << ret;
+}
+
+folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
+    const ForwardInput& input) {
+  JANUS_DLOG(INFO) << "[DIAG-WI] step_async entered";
+  ForwardInput input_on_device;
+
+  prepare_work_before_execute(input, input_on_device);
+  JANUS_DLOG(INFO) << "[DIAG-WI] prepare_work_before_execute completed, scheduling step";
+
+  folly::Promise<std::optional<ForwardOutput>> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        input = std::move(input_on_device),
+                        promise = std::move(promise)]() mutable {
+    if (hierarchy_kv_cache_transfer_ != nullptr) {
+      hierarchy_kv_cache_transfer_->set_layer_synchronizer(input.input_params);
+    }
+
+    // run the model on the given input in working thread
+    if (!enable_schedule_overlap()) {
+      const auto output = this->step(input);
+      promise.setValue(output);
+    } else {
+      if (last_step_output_valid_ && input.token_ids.numel() > 0 &&
+          input.input_params.batch_forward_type.has_decode()) {
+        // replace step i model input with true output of step i-1
+        input = update_input_by_last_step_output(input);
+      }
+
+      const auto output = this->step(input);
+      if (output.has_value()) {
+        if (is_driver() || FLAGS_enable_eplb) {
+          std::unique_lock<std::mutex> lock(mtx_);
+          cv_.wait(lock, [this] { return !is_recorded_; });
+          update_last_step_output(output);
+          is_recorded_ = true;
+          cv_.notify_one();
+        } else {
+          update_last_step_output(output);
+        }
+      } else {
+        if (is_driver() || FLAGS_enable_eplb) {
+          std::unique_lock<std::mutex> lock(mtx_);
+          cv_.wait(lock, [this] { return !is_recorded_; });
+          last_step_output_valid_ = false;
+          is_recorded_ = true;
+          cv_.notify_one();
+        } else {
+          last_step_output_valid_ = false;
+        }
+      }
+      promise.setValue(output);
+    }
+  });
+  return future;
+}
+
+ForwardOutput WorkerImpl::get_last_step_result() {
+  ForwardOutput output;
+  std::unique_lock<std::mutex> lock(mtx_);
+  cv_.wait(lock, [this] { return is_recorded_; });
+  if (last_step_output_valid_ || FLAGS_enable_eplb) {
+    output = last_step_output_;
+  }
+  is_recorded_ = false;
+  cv_.notify_one();
+  return output;
+}
+
+folly::SemiFuture<folly::Unit> WorkerImpl::process_group_test_async() {
+  folly::Promise<folly::Unit> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this, promise = std::move(promise)]() mutable {
+    this->process_group_test();
+    promise.setValue();
+  });
+  return future;
+}
+
+folly::SemiFuture<bool> WorkerImpl::init_model_async(
+    const std::string& model_weights_path,
+    int32_t random_seed,
+    MasterStatus master_status) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        model_weights_path,
+                        random_seed,
+                        master_status,
+                        promise = std::move(promise)]() mutable {
+    auto status =
+        this->init_model(model_weights_path, random_seed, master_status);
+    promise.setValue(status);
+  });
+
+  return future;
+}
+
+bool WorkerImpl::sleep(MasterStatus master_status) {
+  // The memory for kvcache and model weights from hbm is released by xtensor;
+  if (master_status == MasterStatus::LIGHT_SLEEP) {
+    // only load model weights to host memory.
+    auto model_loader = ModelLoader::create(model_weights_path_);
+    model_->lazy_load_model(std::move(model_loader));
+  } else if (master_status == MasterStatus::DEEP_SLEEP) {
+    // only release model weights from host memory.
+    model_->free_model_weights();
+  }
+
+  return true;
+}
+
+bool WorkerImpl::wakeup(const WakeupOptions& options) {
+  if (!options.remote_addrs.empty()) {
+#if defined(USE_NPU)
+    return wakeup_from_remote_weights(options);
+#endif
+    LOG(ERROR) << "Remote weight wakeup only supports npu device.";
+    return false;
+  }
+
+  return wakeup_local(options);
+}
+
+bool WorkerImpl::wakeup_local(const WakeupOptions& options) {
+  if (options.master_status == MasterStatus::LIGHT_SLEEP) {
+#if defined(USE_NPU)
+    if (FLAGS_enable_rolling_load && !is_spec_draft_) {
+      // Reuse rolling runtime state and refresh rolling initialization on
+      // wakeup without re-reading checkpoint in LIGHT_SLEEP.
+      if (!init_rolling_runtime_state()) {
+        LOG(ERROR) << "Failed to initialize rolling runtime state on wakeup";
+        return false;
+      }
+    } else {
+      model_->reload_model_weights();
+    }
+#else
+    model_->reload_model_weights();
+#endif
+  } else if (options.master_status == MasterStatus::DEEP_SLEEP) {
+    auto model_loader = ModelLoader::create(model_weights_path_);
+    this->load_model(std::move(model_loader));
+  }
+  return true;
+}
+
+#if defined(USE_NPU)
+bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
+  // Prefer segment-based transfer if available, fallback to legacy offsets.
+  if (FLAGS_enable_rolling_load) {
+    LOG(ERROR)
+        << "Remote weight wakeup does not support FLAGS_enable_rolling_load";
+    return false;
+  }
+
+  bool use_segments = !options.src_weight_segments.empty();
+  if (use_segments) {
+    if (options.src_weight_segments.size() != options.remote_addrs.size()) {
+      LOG(ERROR) << "remote_addrs and src_weight_segments size mismatch: "
+                 << options.remote_addrs.size() << " vs "
+                 << options.src_weight_segments.size();
+      return false;
+    }
+  } else {
+    // Legacy single-offset mode (backward compatibility).
+    if (options.src_weight_segments.empty() &&
+        options.remote_addrs.size() > 0) {
+      LOG(ERROR) << "No weight segments provided for remote wakeup";
+      return false;
+    }
+  }
+
+  auto& allocator = XTensorAllocator::get_instance();
+  auto* tensors = allocator.get_model_tensors(options_.model_id());
+  if (!tensors || tensors->weight_base_ptr == nullptr ||
+      tensors->weight_num_pages == 0) {
+    LOG(ERROR) << "Weight region not initialized for model "
+               << options_.model_id();
+    return false;
+  }
+
+  auto& global_xtensor = GlobalXTensor::get_instance();
+  if (!global_xtensor.is_initialized()) {
+    LOG(ERROR) << "GlobalXTensor not initialized";
+    return false;
+  }
+  if (!weight_transfer_) {
+    LOG(ERROR) << "MooncakeWeightTransfer not initialized";
+    return false;
+  }
+
+  // Destination is always contiguous (local allocation).
+  uint64_t dst_base_offset =
+      reinterpret_cast<uintptr_t>(tensors->weight_base_ptr) -
+      reinterpret_cast<uintptr_t>(global_xtensor.base_vaddr());
+  for (size_t i = 0; i < options.remote_addrs.size(); ++i) {
+    const auto& segments = options.src_weight_segments[i];
+    uint64_t dst_offset = dst_base_offset;
+    // Pull each segment from source, writing sequentially to destination.
+    for (const auto& seg : segments) {
+      if (!weight_transfer_->pull_weights(
+              options.remote_addrs[i], seg.offset, dst_offset, seg.size)) {
+        LOG(ERROR) << "Failed to pull remote weight segment from "
+                   << options.remote_addrs[i] << ", src_offset=" << seg.offset
+                   << ", size=" << seg.size;
+        return false;
+      }
+      dst_offset += seg.size;
+    }
+  }
+
+  model_->reload_model_weights_from_device();
+  return true;
+}
+#endif
+
+// initialize model, cache manager. async call
+bool WorkerImpl::init_model(const std::string& model_weights_path,
+                            int32_t random_seed,
+                            MasterStatus master_status) {
+  // set same random seed for all worker
+  FLAGS_random_seed = random_seed;
+  device_.set_seed(random_seed);
+
+  auto model_loader = ModelLoader::create(model_weights_path);
+  model_weights_path_ = std::move(model_weights_path);
+  auto tokenizer = model_loader->tokenizer();
+  CHECK(tokenizer != nullptr);
+
+  auto args = model_loader->model_args();
+  auto quant_args = model_loader->quant_args();
+  torch::ScalarType dtype = util::parse_dtype(args.dtype(), device_);
+
+  const int64_t tokenizer_vocab_size = tokenizer->vocab_size();
+  int64_t model_vocab_size = args.vocab_size();
+  // use tokenizer vocab size if model vocab size is not set
+  if (model_vocab_size <= 0) {
+    LOG(WARNING) << "Model vocab size is not set, using tokenizer vocab size: "
+                 << tokenizer_vocab_size;
+    args.vocab_size(tokenizer_vocab_size);
+  } else if (tokenizer_vocab_size > model_vocab_size) {
+    LOG(WARNING) << "Unsafe vocab mismatch: tokenizer: " << tokenizer_vocab_size
+                 << ", model: " << model_vocab_size;
+  }
+
+#if defined(USE_NPU)
+  if (options_.enable_speculative_decode() && FLAGS_enable_atb_spec_kernel) {
+    args.num_speculative_tokens(options_.num_speculative_tokens());
+  }
+#else
+  if (options_.enable_speculative_decode()) {
+    args.num_speculative_tokens(options_.num_speculative_tokens());
+    // When running speculative decoding, the draft worker reuses the same
+    // checkpoint as the target model. The draft worker needs to instantiate
+    // the MTP variant, so override the model_type here without mutating the
+    // original config.
+    if (options_.num_speculative_tokens() == 0 &&
+        args.num_nextn_predict_layers() != 0) {
+      static const std::unordered_map<std::string, std::string>
+          kModelTypeToMtpType = {
+              {"deepseek_v3", "deepseek_v3_mtp"},
+              {"deepseek_v32", "deepseek_v3_mtp"},
+              {"glm_moe_dsa", "glm_moe_dsa_mtp"},
+          };
+      const std::string& current_type = args.model_type();
+      auto it = kModelTypeToMtpType.find(current_type);
+      if (it != kModelTypeToMtpType.end()) {
+        LOG(INFO) << "Overriding draft model_type from " << current_type
+                  << " to " << it->second << " for speculative decoding";
+        args.model_type(it->second);
+      }
+    }
+  }
+#endif
+
+  // create model context
+  dtype_ = dtype;
+  auto tensor_options = torch::dtype(dtype_).device(device_);
+  context_ = ModelContext(parallel_args_, args, quant_args, tensor_options);
+  context_.set_model_id(options_.model_id());
+  context_.set_model_path(model_weights_path_);
+
+  // init model, create model executor
+  bool status = this->init_model(context_);
+  if (!status) {
+    LOG(ERROR) << "init_model failed";
+    return false;
+  }
+
+  int32_t tp_world_size = parallel_args_.world_size();
+  if (parallel_args_.tp_group_) {
+    tp_world_size = parallel_args_.tp_group_->world_size();
+  }
+
+  std::unique_ptr<ScopedAtenLoadThreads> scoped_load_threads;
+  if (tp_world_size > 1) {
+    const int32_t prev_threads = torch::get_num_threads();
+    LOG(INFO) << "Temporarily setting ATen threads to 1 during weight loading"
+              << ", tp_world_size=" << tp_world_size
+              << ", prev_threads=" << prev_threads;
+    scoped_load_threads =
+        std::make_unique<ScopedAtenLoadThreads>(/*target_threads=*/1);
+  }
+
+  if (master_status == MasterStatus::WAKEUP) {
+    this->load_model(std::move(model_loader));
+  } else if (master_status == MasterStatus::LIGHT_SLEEP) {
+    this->lazy_load_model(std::move(model_loader));
+  }
+
+  if (scoped_load_threads) {
+    LOG(INFO) << "Weight loading completed, restored ATen threads="
+              << torch::get_num_threads();
+  }
+
+  status_ = Status::LOADED;
+  if (FLAGS_enable_eplb) {
+    // todo: support xtensor
+    int32_t num_layers = args.n_layers() - args.first_k_dense_replace();
+    int32_t num_device_experts =
+        args.n_routed_experts() / context_.get_parallel_args().world_size() +
+        FLAGS_redundant_experts_num;
+    expert_load_data_ = torch::zeros({num_layers, num_device_experts})
+                            .to(torch::kInt64)
+                            .to(device_)
+                            .contiguous();
+  }
+  return true;
+}
+
+void WorkerImpl::load_model(std::unique_ptr<ModelLoader> loader) {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+#if defined(USE_NPU)
+  // Rolling mode uses host-pinned weights as the single source of truth:
+  // lazy_load_model -> init_rolling_runtime_state() to finish rolling init.
+  if (FLAGS_enable_rolling_load && !is_spec_draft_) {
+    model_->lazy_load_model(std::move(loader));
+    CHECK(init_rolling_runtime_state())
+        << "Failed to initialize rolling runtime state during load_model";
+    return;
+  }
+#endif
+
+  model_->load_model(std::move(loader));
+}
+
+#if defined(USE_NPU)
+bool WorkerImpl::init_rolling_runtime_state() {
+  // Draft model (speculative decoding) has only 1 decoder layer, skip rolling
+  // load.
+  if (!FLAGS_enable_rolling_load || is_spec_draft_) {
+    return true;
+  }
+
+  CHECK(model_ != nullptr) << "Model is not initialized for rolling load";
+  CHECK(load_stream_ != nullptr) << "load_stream_ is null for rolling load";
+
+  // Rolling runtime ownership is moved into model.
+  // Worker provides runtime dependencies and delegates initialization/refresh.
+  const int32_t n_slots = FLAGS_rolling_load_num_cached_layers;
+  const int32_t n_rolling_slots = FLAGS_rolling_load_num_rolling_slots;
+  return model_->init_or_refresh_rolling_runtime(load_stream_.get(),
+                                                 compute_stream_.get(),
+                                                 n_slots,
+                                                 n_rolling_slots,
+                                                 options_.model_id());
+}
+#endif
+
+void WorkerImpl::lazy_load_model(std::unique_ptr<ModelLoader> loader) {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  model_->lazy_load_model(std::move(loader));
+}
+
+folly::SemiFuture<bool> WorkerImpl::allocate_kv_cache_async(
+    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule(
+      [this, &kv_cache_shape, promise = std::move(promise)]() mutable {
+        const bool success = this->allocate_kv_cache(kv_cache_shape);
+        promise.setValue(success);
+      });
+  return future;
+}
+
+folly::SemiFuture<bool> WorkerImpl::allocate_kv_cache_with_transfer_async(
+    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule(
+      [this, &kv_cache_shape, promise = std::move(promise)]() mutable {
+        const bool success =
+            this->allocate_kv_cache_with_transfer(kv_cache_shape);
+        promise.setValue(success);
+      });
+  return future;
+}
+
+folly::SemiFuture<bool> WorkerImpl::pull_kv_blocks_async(
+    uint64_t src_cluster_id,
+    const std::string& src_addr,
+    int64_t src_k_cache_id,
+    int64_t src_v_cache_id,
+    const std::vector<uint64_t>& src_blocks,
+    const std::vector<uint64_t>& dst_blocks) {
+#if defined(USE_NPU)
+  return kv_cache_transfer_->pull_kv_blocks_async(src_cluster_id,
+                                                  src_addr,
+                                                  src_k_cache_id,
+                                                  src_v_cache_id,
+                                                  src_blocks,
+                                                  dst_blocks);
+#endif
+  return false;
+}
+
+uint32_t WorkerImpl::transfer_kv_blocks(
+    const uint64_t batch_id,
+    const std::vector<BlockTransferInfo>& block_transfer_info) {
+  return hierarchy_kv_cache_transfer_->transfer_kv_blocks(
+      batch_id, std::move(block_transfer_info));
+}
+
+uint32_t WorkerImpl::transfer_kv_blocks(
+    const uint64_t batch_id,
+    Slice<BlockTransferInfo>& block_transfer_info) {
+  return hierarchy_kv_cache_transfer_->transfer_kv_blocks(batch_id,
+                                                          block_transfer_info);
+}
+
+int64_t WorkerImpl::get_active_activation_memory() {
+  return DeviceMonitor::get_instance()
+      .get_device_stats(device_.index())
+      .active_activation_memory;
+}
+
+void WorkerImpl::init_hierarchy_kv_cache_transfer() {
+  if (options_.host_blocks_factor() > 1 || options_.enable_kvcache_store()) {
+    HierarchyKVCacheTransfer::Options transfer_options;
+    transfer_options
+        .tp_rank(options_.dp_size() > 1
+                     ? options_.node_rank() % options_.dp_size()
+                     : options_.node_rank())
+        .layers(context_.get_model_args().n_layers())
+        .host_blocks_factor(options_.host_blocks_factor())
+        .layers_wise_copy_batchs(options_.layers_wise_copy_batchs())
+        .enable_kvcache_store(options_.enable_kvcache_store())
+        .store_protocol(options_.store_protocol())
+        .store_master_server_address(options_.store_master_server_address())
+        .store_metadata_server(options_.store_metadata_server())
+        .store_local_hostname(options_.store_local_hostname());
+    hierarchy_kv_cache_transfer_ = std::make_unique<HierarchyKVCacheTransfer>(
+        transfer_options, device_, &kv_caches_);
+  }
+}
+void WorkerImpl::prepare_mla_prefixcache_inputs(
+    ModelInputParams& input_params) {
+  int32_t sum_prefix = input_params.kv_cache_tokens_nums.sum().item<int>();
+  input_params.history_compressed_kv =
+      torch::empty({sum_prefix, context_.get_model_args().kv_lora_rank()},
+                   torch::TensorOptions().dtype(dtype_).pinned_memory(true))
+          .to(device_);
+
+  input_params.history_k_rope =
+      torch::empty({sum_prefix, context_.get_model_args().qk_rope_head_dim()},
+                   torch::TensorOptions().dtype(dtype_).pinned_memory(true))
+          .to(device_);
+  ;
+
+  input_params.ring_cur_seqlen =
+      torch::stack({input_params.q_seq_lens, input_params.q_seq_lens})
+          .to(device_);
+
+  input_params.ring_cache_seqlen =
+      torch::stack({input_params.q_seq_lens,
+                    input_params.kv_cache_tokens_nums.to(device_)})
+          .to(device_);
+
+  torch::Tensor ring_cur_seqlen_host =
+      input_params.ring_cur_seqlen.cpu().contiguous();
+  torch::Tensor ring_cache_seqlen_host =
+      input_params.ring_cache_seqlen.cpu().contiguous();
+  input_params.ring_cur_seqlen_host = std::vector<int>(
+      ring_cur_seqlen_host.data_ptr<int>(),
+      ring_cur_seqlen_host.data_ptr<int>() + ring_cur_seqlen_host.numel());
+  input_params.ring_cache_seqlen_host = std::vector<int>(
+      ring_cache_seqlen_host.data_ptr<int>(),
+      ring_cache_seqlen_host.data_ptr<int>() + ring_cache_seqlen_host.numel());
+}
+
+int64_t WorkerImpl::get_num_layers() const {
+  int64_t num_layers = context_.get_model_args().n_layers();
+#if !defined(USE_NPU)
+  if (is_spec_draft_) {
+    // for MTP draft models, the number of layers is the number of nextn
+    // predict layers
+    int64_t num_nextn_predict_layers =
+        context_.get_model_args().num_nextn_predict_layers();
+    if (num_nextn_predict_layers > 0) {
+      return num_nextn_predict_layers;
+    }
+  }
+#endif
+  return num_layers;
+}
+
+}  // namespace janus

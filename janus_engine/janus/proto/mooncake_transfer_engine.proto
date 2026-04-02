@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package janus.proto;
+option cc_enable_arenas = true;
+option cc_generic_services = true;
+
+import "common.proto";
+
+message SessionInfo {
+  string addr = 1;
+}
+
+service MooncakeTransferEngineService {
+  rpc OpenSession(SessionInfo) returns (Status) {}
+  rpc CloseSession(SessionInfo) returns (Status) {}
+}

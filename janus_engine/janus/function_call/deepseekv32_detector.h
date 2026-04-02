@@ -1,0 +1,57 @@
+#pragma once
+
+#include <regex>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#include "base_format_detector.h"
+
+namespace janus {
+namespace function_call {
+
+class DeepSeekV32Detector : public BaseFormatDetector {
+ public:
+  DeepSeekV32Detector();
+
+  virtual ~DeepSeekV32Detector() = default;
+
+  bool has_tool_call(const std::string& text) override;
+
+  StreamingParseResult detect_and_parse(
+      const std::string& text,
+      const std::vector<JsonTool>& tools) override;
+
+  StreamingParseResult parse_streaming_increment(
+      const std::string& new_text,
+      const std::vector<JsonTool>& tools) override;
+
+ private:
+  std::regex function_calls_regex_;
+  std::regex invoke_regex_;
+  // For streaming: matches invoke with optional closing tag (group 3 =
+  // "</｜DSML｜invoke>" or "")
+  std::regex streaming_invoke_regex_;
+  std::regex parameter_regex_;
+  std::regex partial_parameter_regex_;
+
+  std::string invoke_end_token_;
+  std::vector<std::string> prefix_parameter_end_call_;
+  std::string utf8_buffer_;
+
+  std::string trim_whitespace(std::string_view str) const;
+
+  std::pair<std::string, std::string> split_incomplete_utf8(
+      const std::string& str) const;
+
+  std::unordered_map<std::string, nlohmann::json> parse_parameters_from_xml(
+      const std::string& invoke_content,
+      bool allow_partial = false) const;
+
+  std::vector<ToolCallItem> parse_json_tool_calls(
+      const std::string& text,
+      const std::vector<JsonTool>& tools);
+};
+
+}  // namespace function_call
+}  // namespace janus

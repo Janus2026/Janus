@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package janus.proto;
+
+message ModelCard {
+  // The model identifier, which can be referenced in the API endpoints.
+  optional string id = 1;
+
+  // The Unix timestamp (in seconds) when the model was created.
+  optional uint32 created = 2;
+
+  // the object type, which is always "model".
+  optional string object = 3;  
+
+  // the organization that owns the model.
+  optional string owned_by = 4 [json_name = "owned_by"];
+}
+
+message ModelList {
+  optional string object = 1;
+  repeated ModelCard data = 2;
+}
+
+message ModelListRequest {
+  // The model identifier.
+  // string model = 1;
+}
+
+message ModelListResponse {
+  // The list of models.
+  repeated ModelCard data = 1;
+}

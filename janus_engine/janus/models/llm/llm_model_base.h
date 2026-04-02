@@ -1,0 +1,242 @@
+#pragma once
+
+#include <glog/logging.h>
+#include <torch/torch.h>
+
+#include <string>
+#include <vector>
+
+#include "core/common/interruption_bus.h"
+#include "core/common/rec_model_utils.h"
+#include "core/framework/kv_cache/kv_cache.h"
+#include "core/framework/model/model_input_params.h"
+#include "core/framework/model/model_output.h"
+#include "core/framework/model_context.h"
+#include "core/layers/common/attention_metadata_builder.h"
+#include "core/layers/common/lm_head.h"
+#include "core/layers/common/rms_norm.h"
+#include "models/model_registry.h"
+
+namespace janus {
+
+template <typename DecoderLayerType>
+class LlmModelImplBase : public torch::nn::Module {
+ public:
+  // mode type: qwen2, qwen3 .etc
+  LlmModelImplBase(const std::string& model_type, const ModelArgs& args)
+      : model_type_(model_type) {
+    InterruptionBus::get_instance().subscribe([this](bool interrupted) {
+      this->layer_forward_interrupted_ = interrupted;
+    });
+    mrope_section_ = args.rope_scaling_mrope_section();
+  }
+
+  torch::Tensor get_input_embeddings(torch::Tensor input_ids) {
+    return embed_tokens_(input_ids);
+  }
+
+  virtual std::pair<torch::Tensor, torch::Tensor> apply_mrope(
+      const torch::Tensor positions) {
+    return std::make_pair(torch::Tensor(), torch::Tensor());
+  }
+
+  // tokens: [num_tokens]
+  // positions: [num_tokens] token pos in the sequence
+  virtual ModelOutput forward(torch::Tensor tokens,
+                              torch::Tensor positions,
+                              std::vector<KVCache>& kv_caches,
+                              const ModelInputParams& input_params) {
+    if (tokens.numel() == 0) {
+      tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
+      positions = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
+    }
+    auto inputs_embeds = input_params.input_embedding;
+    // test
+    torch::Tensor h;
+    if (inputs_embeds.defined()) {
+      h = inputs_embeds;
+    } else {
+      h = embed_tokens_(tokens);
+    }
+
+    auto modified_input_params = input_params;
+    auto& dp_token_nums = modified_input_params.dp_global_token_nums;
+    std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
+    if (!modified_input_params.attn_metadata) {
+      modified_input_params.attn_metadata =
+          std::make_shared<layer::AttentionMetadata>(
+              layer::AttentionMetadataBuilder::build(modified_input_params));
+    }
+    auto& attn_metadata = *(modified_input_params.attn_metadata);
+    if (positions.dim() == 2) {
+      std::tie(attn_metadata.mrope_cos, attn_metadata.mrope_sin) =
+          apply_mrope(positions);
+    }
+
+    const LlmRecMultiRoundParams* llmrec_params = nullptr;
+    if (is_rec_multi_round_mode() &&
+        modified_input_params.has_llmrec_params()) {
+      llmrec_params = modified_input_params.llmrec_params();
+      CHECK_EQ(llmrec_params->full_k_caches.size(), layers_.size())
+          << "Rec multi-round mode requires full_k_caches per layer.";
+      CHECK_EQ(llmrec_params->full_v_caches.size(), layers_.size())
+          << "Rec multi-round mode requires full_v_caches per layer.";
+      CHECK_EQ(llmrec_params->unshared_k_caches.size(), layers_.size())
+          << "Rec multi-round mode requires unshared_k_caches per layer.";
+      CHECK_EQ(llmrec_params->unshared_v_caches.size(), layers_.size())
+          << "Rec multi-round mode requires unshared_v_caches per layer.";
+    }
+
+    std::optional<torch::Tensor> residual;
+    for (size_t i = 0; i < layers_.size(); i++) {
+      if (llmrec_params != nullptr) {
+        attn_metadata.full_k_cache = llmrec_params->full_k_caches[i];
+        attn_metadata.full_v_cache = llmrec_params->full_v_caches[i];
+        attn_metadata.unshared_k_cache = llmrec_params->unshared_k_caches[i];
+        attn_metadata.unshared_v_cache = llmrec_params->unshared_v_caches[i];
+      }
+#if defined(USE_CUDA) || defined(USE_MUSA)
+      attn_metadata.plan_info->layer_id = i;
+#endif
+      auto& layer = layers_[i];
+      h = layer(h,
+                residual,
+                positions,
+                attn_metadata,
+                kv_caches[i],
+                modified_input_params);
+    }
+    auto [hidden_states, residual_out] = norm_(h, residual);
+    return ModelOutput(hidden_states, residual_out);
+  }
+
+  // load the weight from the checkpoint
+  virtual void load_state_dict(const StateDict& state_dict) {
+    embed_tokens_->load_state_dict(
+        state_dict.get_dict_with_prefix("embed_tokens."));
+
+    // call each layer's load_state_dict function
+    for (size_t i = 0; i < layers_.size(); i++) {
+      layers_[i]->load_state_dict(
+          state_dict.get_dict_with_prefix("layers." + std::to_string(i) + "."));
+    }
+    norm_->load_state_dict(state_dict.get_dict_with_prefix("norm."));
+  }
+
+  virtual layer::WordEmbedding get_word_embedding() { return embed_tokens_; }
+
+  virtual void set_word_embedding(layer::WordEmbedding& word_embedding) {
+    embed_tokens_ = word_embedding;
+  }
+
+ protected:
+  torch::Tensor cos_sin_;
+  int32_t max_seq_len_ = 0;
+  std::vector<int64_t> mrope_section_;
+  layer::WordEmbedding embed_tokens_{nullptr};
+  layer::RMSNorm norm_{nullptr};
+
+  // hold same data but different type as blocks_ to avoid type cast
+  std::vector<DecoderLayerType> layers_;
+
+  bool layer_forward_interrupted_ = false;
+
+ private:
+  std::string model_type_;
+};
+
+template <typename LlmModelType>
+class LlmForCausalLMImplBase : public torch::nn::Module {
+ public:
+  LlmForCausalLMImplBase(const ModelContext& context) {
+    tie_word_embeddings = context.get_model_args().tie_word_embeddings();
+    // register submodules
+    model_ = register_module("model", LlmModelType(context));
+    lm_head_ = register_module("lm_head", layer::LmHead(context));
+  }
+
+  torch::Tensor get_input_embeddings(torch::Tensor input_ids) {
+    return model_->get_input_embeddings(input_ids);
+  }
+
+  // tokens: [num_tokens]
+  // positions: [num_tokens] token pos in the sequence
+  // returns: [num_tokens, hidden_size]
+  virtual ModelOutput forward(const torch::Tensor& tokens,
+                              const torch::Tensor& positions,
+                              std::vector<KVCache>& kv_caches,
+                              const ModelInputParams& input_params) {
+    return model_(tokens, positions, kv_caches, input_params);
+  }
+
+  // hidden_states: [num_tokens, hidden_size]
+  // seleted_idxes: [num_tokens]
+  // returns: [num_tokens, vocab_size]
+  virtual torch::Tensor logits(const torch::Tensor& hidden_states,
+                               const torch::Tensor& seleted_idxes) {
+    // select tokens if provided
+    auto h = hidden_states;
+    if (seleted_idxes.defined()) {
+      h = h.index_select(/*dim=*/0, seleted_idxes);
+    }
+    return lm_head_(h);
+  }
+
+  // hidden_states: [num_tokens, hidden_size]
+  // seleted_idxes: [num_tokens]
+  // returns: [num_seqs, hidden_size]
+  virtual torch::Tensor pooler(const torch::Tensor& hidden_states,
+                               const torch::Tensor& seleted_idxes) {
+    auto h = hidden_states;
+    if (seleted_idxes.defined()) {
+      h = h.index_select(/*dim=*/0, seleted_idxes);
+    }
+    return h;
+  }
+
+  virtual void load_model(
+      std::unique_ptr<ModelLoader> loader,
+      std::string prefix = "model." /*llm model weight prefix*/) {
+    for (const auto& state_dict : loader->get_state_dicts()) {
+      auto sub_dict = state_dict->get_dict_with_prefix(prefix);
+      if (sub_dict.size() == 0) {
+        sub_dict = state_dict->get_dict_with_prefix("");
+      }
+      model_->load_state_dict(sub_dict);
+
+      if (tie_word_embeddings) {
+        lm_head_->load_state_dict(
+            state_dict->get_dict_with_prefix(prefix + "embed_tokens."));
+      } else {
+        lm_head_->load_state_dict(state_dict->get_dict_with_prefix("lm_head."));
+      }
+    }
+  }
+
+  virtual void prepare_expert_weight(int32_t layer_id,
+                                     const std::vector<int32_t>& expert_ids) {
+    return;
+  }
+  virtual void update_expert_weight(int32_t layer_id) { return; }
+
+  virtual layer::LmHead get_lm_head() { return lm_head_; }
+
+  virtual void set_lm_head(layer::LmHead& head) { lm_head_ = head; }
+
+  virtual layer::WordEmbedding get_word_embedding() {
+    return model_->get_word_embedding();
+  }
+
+  virtual void set_word_embedding(layer::WordEmbedding& word_embedding) {
+    model_->set_word_embedding(word_embedding);
+  }
+
+ protected:
+  // parameter members, must be registered
+  LlmModelType model_{nullptr};
+  bool tie_word_embeddings{false};
+  // test
+  layer::LmHead lm_head_{nullptr};
+};
+
+}  // namespace janus

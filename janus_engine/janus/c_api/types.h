@@ -1,0 +1,551 @@
+#ifndef JANUS_C_TYPES_H
+#define JANUS_C_TYPES_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+// Maximum length for meta string fields (includes '\0' terminator)
+#define JANUS_META_STRING_FIELD_MAX_LEN 128
+
+// Export Macro Definition
+#ifndef JANUS_CAPI_EXPORT
+#define JANUS_CAPI_EXPORT __attribute__((visibility("default")))
+#endif
+
+// Core Struct & Enum Definitions
+
+/**
+ * @brief Configuration options for initializing an LLM instance
+ * @note All string fields are fixed-length arrays. Default values are defined
+ * in macros. Empty string indicates disable/use default value.
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_InitOptions {
+  /** Whether to enable multi-head latent attention */
+  bool enable_mla;
+
+  /** Whether to enable chunked prefill for inference */
+  bool enable_chunked_prefill;
+
+  /** Whether to enable prefill-only sequence parallel */
+  bool enable_prefill_sp;
+
+  /** Whether to enable prefix cache optimization */
+  bool enable_prefix_cache;
+
+  /** Whether to enable disaggregated prefill and decode execution */
+  bool enable_disagg_pd;
+
+  /** Whether to enable online-offline co-location in disaggregated PD mode */
+  bool enable_pd_ooc;
+
+  /** Whether to enable schedule overlap for parallel execution */
+  bool enable_schedule_overlap;
+
+  /** Whether to enable shared memory for model execution */
+  bool enable_shm;
+
+  /** KVCache transfer listen port */
+  uint32_t transfer_listen_port;
+
+  /** Number of multi-nodes in distributed deployment */
+  uint32_t nnodes;
+
+  /** Node rank in distributed deployment */
+  uint32_t node_rank;
+
+  /** Data parallel size for MLA attention */
+  uint32_t dp_size;
+
+  /** Expert parallel size for MoE model */
+  uint32_t ep_size;
+
+  /** Number of slots per kv cache block */
+  uint32_t block_size;
+
+  /** Max GPU memory size for kv cache (0 = auto-calculate available memory) */
+  uint32_t max_cache_size;
+
+  /** Max number of tokens per batch */
+  uint32_t max_tokens_per_batch;
+
+  /** Max number of sequences per batch */
+  uint32_t max_seqs_per_batch;
+
+  /** Max number of token per chunk in prefill stage */
+  uint32_t max_tokens_per_chunk_for_prefill;
+
+  /** Number of speculative tokens for speculative decoding */
+  uint32_t num_speculative_tokens;
+
+  /** Number of threads for handling input requests */
+  uint32_t num_request_handling_threads;
+
+  /** Expert parallel degree for MoE model */
+  uint32_t expert_parallel_degree;
+
+  /** Index ID for internal server ID (unique for multiple models/versions) */
+  uint32_t server_idx;
+
+  /** Beam width for beam search decoding (1 for greedy search) */
+  uint32_t beam_width;
+
+  /** Maximum number of decode rounds for each inference request */
+  uint32_t max_decode_rounds;
+
+  /** Maximum number of tokens allowed per inference request */
+  uint32_t max_token_per_req;
+
+  /** Maximum GPU memory utilization ratio for model inference */
+  float max_memory_utilization;
+
+  /** Model task type (generate/embed) */
+  char task[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** NPU communication backend (lccl/hccl). Use hccl when dp is enabled */
+  char communication_backend[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** Instance role (DEFAULT/PREFILL/DECODE/MIX) */
+  char instance_role[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** Device IP address for NPU communication */
+  char device_ip[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** Master address for multi-node distributed serving (e.g. 10.18.1.1:9999) */
+  char master_node_addr[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** XService server address (empty string = disable XService) */
+  char xservice_addr[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** Unique instance name for identification */
+  char instance_name[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** KV cache transfer mode (PUSH/PULL) */
+  char kv_cache_transfer_mode[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** Log directory path (empty string = disable logging) */
+  char log_dir[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** Draft hf model path (empty string = no draft model) */
+  char draft_model[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /**
+   * Devices to run the draft model on (e.g. npu:0, npu:0,npu:1).
+   * Empty string = use the same devices as main model
+   */
+  char draft_devices[JANUS_META_STRING_FIELD_MAX_LEN];
+} JANUS_InitLLMOptions;
+
+/**
+ * @brief Chat message structure (for ChatCompletions)
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_ChatMessage {
+  /** Message role (system/user/assistant) */
+  char role[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** Message content (NULL for function call messages) */
+  char* content;
+} JANUS_ChatMessage;
+
+/**
+ * @brief Inference request parameters
+ * @note All numeric fields are fixed-width integers with value ranges defined
+ * in macros;
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_RequestParams {
+  /** Whether to include original prompt in response */
+  bool echo;
+
+  /** Whether it's an offline request */
+  bool offline;
+
+  /** Whether to return token log probabilities */
+  bool logprobs;
+
+  /** Whether to ignore EOS token */
+  bool ignore_eos;
+
+  /** Number of completions to return per prompt */
+  uint32_t n;
+
+  /** Maximum number of tokens to generate. Must be <= model context length */
+  uint32_t max_tokens;
+
+  /** Number of sequences to generate per prompt for top-n selection */
+  uint32_t best_of;
+
+  /** SLO timeout in milliseconds (0 = unlimited) */
+  int32_t ttlt_slo_ms;
+
+  int32_t ttft_slo_ms;
+
+  int32_t tpot_slo_ms;
+
+  /** Beam search width (0 = disable beam search) */
+  uint32_t beam_width;
+
+  /** Number of top log probabilities to return */
+  int64_t top_logprobs;
+
+  /** Top-K sampling cutoff (-1 = 0xFFFFFFFF means disabled) */
+  int64_t top_k;
+
+  /** Top-P sampling cutoff (range: [0.0, 1.0]) */
+  float top_p;
+
+  /** Frequency penalty (range: [0.0, 2.0]) */
+  float frequency_penalty;
+
+  /** Presence penalty (range: [-2.0, 2.0]) */
+  float presence_penalty;
+
+  /** Repetition penalty. >1.0 encourages new tokens, <1.0 encourages repetition
+   */
+  float repetition_penalty;
+
+  /** Sampling temperature (range: [0.0, 2.0]) */
+  float temperature;
+
+  /** Request id */
+  char request_id[JANUS_META_STRING_FIELD_MAX_LEN];
+} JANUS_RequestParams;
+
+/**
+ * @brief API response status codes
+ */
+typedef enum JANUS_CAPI_EXPORT JANUS_StatusCode {
+  /** Request succeeded */
+  kSuccess = 0,
+
+  /** LLM instance not initialized */
+  kNotInitialized = 1,
+
+  /** Specified model ID not loaded */
+  kModelNotFound = 2,
+
+  /** Request timed out */
+  kTimeout = 3,
+
+  /** Invalid input parameters */
+  kInvalidRequest = 4,
+
+  /** Internal system error */
+  kInternalError = 5
+} JANUS_StatusCode;
+
+/**
+ * @brief Token usage statistics for inference request
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_Usage {
+  /** Number of tokens in the prompt */
+  int32_t prompt_tokens;
+
+  /** Number of tokens in the generated completion */
+  int32_t completion_tokens;
+
+  /** Total tokens used (prompt + completion) */
+  int32_t total_tokens;
+} JANUS_Usage;
+
+/**
+ * @brief Token log probability structure
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_LogProb {
+  /** Token ID */
+  uint32_t token_id;
+
+  /** Log probability of the token */
+  float logprob;
+} JANUS_LogProb;
+
+/**
+ * @brief List of token log probabilities
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_LogProbs {
+  /** Pointer to array of log probability entries */
+  JANUS_LogProb* entries;
+
+  /** Number of entries in the logprobs array */
+  size_t entries_size;
+} JANUS_LogProbs;
+
+/**
+ * @brief Inference result candidate
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_Choice {
+  /** Index of the generated completion candidate */
+  uint32_t index;
+
+  /** Generated text for completions inference (NULL for Chat mode) */
+  char* text;
+
+  /** Generated message for chatcompletions inference (NULL for Completion mode)
+   */
+  JANUS_ChatMessage* message;
+
+  /** Generated token ids */
+  int32_t* token_ids;
+
+  /** Generated token ids size */
+  size_t token_size;
+
+  /** Token log probabilities */
+  JANUS_LogProbs logprobs;
+
+  /** Reason generation stopped (stop/length/function_call) */
+  char finish_reason[JANUS_META_STRING_FIELD_MAX_LEN];
+} JANUS_Choice;
+
+/**
+ * @brief List of inference result candidates
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_Choices {
+  /** Pointer to array of completion choice entries */
+  JANUS_Choice* entries;
+
+  /** Number of entries in the choices array */
+  size_t entries_size;
+} JANUS_Choices;
+
+#define JANUS_ERROR_INFO_MAX_LEN 512
+
+/**
+ * @brief Inference response structure
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_Response {
+  /** Response status code (0 = success, non-zero = error) */
+  JANUS_StatusCode status_code;
+
+  /** Error details (NULL = no error) */
+  char error_info[JANUS_ERROR_INFO_MAX_LEN];
+
+  /** Unique ID for the completion request (fixed-length string) */
+  char id[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** Object type (fixed to "text_completion") */
+  char object[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** Unix timestamp (seconds) of when the completion was created */
+  int64_t created;
+
+  /** Model name used for the completion */
+  char model[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** List of generated completion candidates */
+  JANUS_Choices choices;
+
+  /** Token usage statistics for the request */
+  JANUS_Usage usage;
+} JANUS_Response;
+
+/**
+ * @brief Enumeration of tensor data types
+ */
+typedef enum JANUS_CAPI_EXPORT JANUS_DataType {
+  JANUS_DTYPE_UNDEFINED = 0,
+  JANUS_DTYPE_FLOAT16 = 1,
+  JANUS_DTYPE_FLOAT32 = 2,
+  JANUS_DTYPE_FLOAT64 = 3,
+  JANUS_DTYPE_BFLOAT16 = 4,
+  JANUS_DTYPE_INT8 = 5,
+  JANUS_DTYPE_INT16 = 6,
+  JANUS_DTYPE_INT32 = 7,
+  JANUS_DTYPE_INT64 = 8,
+  JANUS_DTYPE_UINT8 = 9,
+  JANUS_DTYPE_UINT16 = 10,
+  JANUS_DTYPE_UINT32 = 11,
+  JANUS_DTYPE_UINT64 = 12,
+  JANUS_DTYPE_BOOL = 13,
+  JANUS_DTYPE_STRING = 14
+} JANUS_DataType;
+
+/**
+ * @brief Structure representing tensor dimensions (shape)
+ * @note Max supported rank is 8 (matches dim array length)
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_Dims {
+  /** Number of dimensions (0=scalar, 1=vector, ..., 8) */
+  int rank;
+
+  /** Size of each dimension (unused dims must be 0) */
+  int dim[8];
+} JANUS_Dims;
+
+/**
+ * @brief Core tensor structure for numerical computation
+ * @warning 1. data pointer is read-only, managed by external caller
+ *          2. dtype must match the actual type of data buffer
+ *          3. dims.rank must not exceed 8
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_Tensor {
+  /** Data type of tensor elements */
+  JANUS_DataType dtype;
+
+  /** Dimension information (shape) of the tensor */
+  JANUS_Dims dims;
+
+  /** Read-only pointer to tensor data buffer */
+  const void* data;
+} JANUS_Tensor;
+
+/**
+ * @brief Dynamic list of tensors (replaces C++ std::vector<JANUS_Tensor>)
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_Tensors {
+  JANUS_Tensor* entries;
+  size_t entries_size;
+} JANUS_Tensors;
+
+/**
+ * @brief Enumeration of multimodal data types (bitmask compatible)
+ * @note Each type is a bit flag (supports multiple types via type_mask)
+ */
+typedef enum JANUS_CAPI_EXPORT JANUS_MM_Type {
+  /** No multimodal type (invalid state) */
+  JANUS_MM_TYPE_NONE = 0,
+
+  /** Image modality (JPG/PNG/BMP) */
+  JANUS_MM_TYPE_IMAGE = 1 << 0,
+
+  /** Audio modality (WAV/MP3) */
+  JANUS_MM_TYPE_AUDIO = 1 << 1,
+
+  /** Video modality (H264/H265) */
+  JANUS_MM_TYPE_VIDEO = 1 << 2,
+
+  /** Text modality (tokenized text) */
+  JANUS_MM_TYPE_TEXT = 1 << 3,
+
+  /** Embedding modality (token embeddings) */
+  JANUS_MM_TYPE_EMBEDDING = 1 << 4
+} JANUS_MM_Type;
+
+/**
+ * @brief Multimodal value (variant type: single tensor or tensor list)
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_MM_Value {
+  /** Type flag: true=single tensor, false=tensor list */
+  bool is_single_tensor;
+
+  union {
+    /** Single tensor (valid if is_single_tensor=true) */
+    JANUS_Tensor tensor;
+
+    /** Tensor list (valid if is_single_tensor=false) */
+    JANUS_Tensors tensors;
+  } data;
+} JANUS_MM_Value;
+
+/**
+ * @brief Single entry in multimodal dictionary (key-value pair)
+ * @note 1. Key is fixed-length string (null-terminated if shorter than max len)
+ *       2. Key must be unique within a dictionary
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_MM_DictEntry {
+  /** Fixed-length key */
+  char key[JANUS_META_STRING_FIELD_MAX_LEN];
+
+  /** Value associated with the key */
+  JANUS_MM_Value value;
+} JANUS_MM_DictEntry;
+
+/**
+ * @brief Multimodal dictionary (array of key-value entries)
+ * @note 1. entries is a heap-allocated array (must be freed by caller)
+ *       2. entries_size = number of valid entries (no empty slots)
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_MM_Dict {
+  JANUS_MM_DictEntry* entries;
+  size_t entries_size;
+} JANUS_MM_Dict;
+
+/**
+ * @brief Token position information (offset + length) for multimodal data
+ * @note Used to map multimodal data to token positions in sequence
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_MM_TokenPos {
+  /** Start offset of tokens (0-based) */
+  uint32_t offset;
+
+  /** Number of tokens (must be >0 for valid position) */
+  uint32_t length;
+} JANUS_MM_TokenPos;
+
+/**
+ * @brief Base struct for multimodal metadata (to be extended by specific
+ * modalities)
+ * @note This is a placeholder for modality-specific metadata (e.g., image size,
+ * audio sample rate) Extend with union for image/audio/video metadata in
+ * production use
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_MM_Meta {
+  // Placeholder for future extension,
+  // e.g., JANUS_ImageMeta|JANUS_AudioMeta|JANUS_VideoMeta
+} JANUS_MM_Meta;
+
+/**
+ * @brief State information for a single multimodal item
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_MM_State {
+  /** Token position for multimodal data alignment */
+  JANUS_MM_TokenPos token_pos;
+} JANUS_MM_State;
+
+/**
+ * @brief Single multimodal data item (core unit of multimodal data)
+ * @note 1. type = modality type (image/audio/video/text/embedding)
+ *       2. data = numerical content (tensor/tensor list)
+ *       3. meta = modality-specific metadata (empty in base version)
+ *       4. state = token position and processing state
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_MM_Item {
+  /** Modality type (e.g., JANUS_MM_TYPE_EMBEDDING) */
+  JANUS_MM_Type type;
+
+  /** Core data (tensor/tensor list) */
+  JANUS_MM_Value data;
+
+  /** Modality-specific metadata (extendable) */
+  JANUS_MM_Meta meta;
+
+  /** Processing state and token position */
+  JANUS_MM_State state;
+} JANUS_MM_Item;
+
+/**
+ * @brief List of multimodal items (replaces C++ std::vector<JANUS_MM_Item>)
+ * @note 1. entries is a heap-allocated array (must be freed by caller)
+ *       2. entries_size = number of valid items (no empty slots)
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_MM_Items {
+  JANUS_MM_Item* entries;
+  size_t entries_size;
+} JANUS_MM_Items;
+
+/**
+ * @brief Core multimodal data container (supports list/dict storage)
+ */
+typedef struct JANUS_CAPI_EXPORT JANUS_MM_Data {
+  /** Bitmask of multimodal types (e.g., IMAGE | EMBEDDING) */
+  uint32_t type_mask;
+
+  /** Storage type: true=JANUS_MM_Dict, false=JANUS_MM_Items */
+  bool is_dict;
+  union {
+    /** Dict storage (valid if is_dict=true) */
+    JANUS_MM_Dict dict;
+
+    /** List storage (valid if is_dict=false) */
+    JANUS_MM_Items items;
+  } data;
+} JANUS_MM_Data;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // JANUS_C_TYPES_H

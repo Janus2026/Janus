@@ -1,0 +1,443 @@
+#include <arpa/inet.h>
+#include <folly/init/Init.h>
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <pybind11/embed.h>
+#include <sys/socket.h>
+#include <torch/torch.h>
+#include <unistd.h>
+
+#include <csignal>
+#include <filesystem>
+#include <memory>
+#include <unordered_set>
+
+#include "api_service/api_service.h"
+#include "core/common/global_flags.h"
+#include "core/common/help_formatter.h"
+#include "core/common/instance_name.h"
+#include "core/common/metrics.h"
+#include "core/common/options.h"
+#include "core/common/types.h"
+#include "core/distributed_runtime/master.h"
+#include "core/framework/xtensor/global_xtensor.h"
+#include "core/framework/xtensor/options.h"
+#include "core/framework/xtensor/xtensor_allocator.h"
+#include "core/util/device_name_utils.h"
+#include "core/util/json_reader.h"
+#include "core/util/model_type_utils.h"
+#include "core/util/net.h"
+#include "core/util/utils.h"
+#include "function_call/function_call_parser.h"
+#include "models/model_registry.h"
+#include "parser/reasoning_parser.h"
+#include "server/janus_server_registry.h"
+using namespace janus;
+
+static std::atomic<uint32_t> signal_received{0};
+
+static const std::unordered_set<std::string> prefill_sp_supported_model_set = {
+    "deepseek_v32",
+    "glm_moe_dsa"};
+
+void shutdown_handler(int signal) {
+  // TODO: gracefully shutdown the server
+  LOG(WARNING) << "Received signal " << signal << ", stopping server...";
+  exit(1);
+}
+
+std::string get_model_type(const std::filesystem::path& model_path) {
+  JsonReader reader;
+  // for llm, vlm and rec models, the config.json file is in the model path
+  std::filesystem::path config_json_path = model_path / "config.json";
+
+  if (std::filesystem::exists(config_json_path)) {
+    reader.parse(config_json_path);
+    // Prefer model_type (e.g. LLM/VLM); fall back to model_name for configs
+    // that only have model_name (e.g. LongCat-Image: {"model_name":
+    // "LongCat-Image"}).
+    auto model_type = reader.value<std::string>("model_type");
+    if (!model_type.has_value()) {
+      model_type = reader.value<std::string>("model_name");
+    }
+    if (!model_type.has_value()) {
+      LOG(FATAL) << "Please check config.json file in model path: "
+                 << model_path
+                 << ", it should contain model_type or model_name key.";
+    }
+    return model_type.value();
+  } else {
+    LOG(FATAL) << "Please check config.json or model_index.json file, one of "
+                  "them should exist in the model path: "
+               << model_path;
+  }
+  return "";
+}
+
+std::string get_model_backend(const std::filesystem::path& model_path) {
+  JsonReader reader;
+  // for dit models, the model_index.json file is in the model path
+  std::filesystem::path model_index_json_path = model_path / "model_index.json";
+
+  if (std::filesystem::exists(model_index_json_path)) {
+    reader.parse(model_index_json_path);
+
+    if (reader.value<std::string>("_diffusers_version").has_value()) {
+      return "dit";
+    } else {
+      LOG(FATAL) << "Please check model_index.json file in model path: "
+                 << model_path << ", it should contain _diffusers_version key.";
+    }
+  }
+
+  // for llm, vlm and rec models, get backend from model type
+  std::string model_type = get_model_type(model_path);
+  // model_type always exists since get_model_type() will log fatal error if
+  // model_type is empty
+  return ModelRegistry::get_model_backend(model_type);
+}
+
+void validate_flags(const std::string& model_type) {
+  if (FLAGS_backend.empty()) {
+    LOG(FATAL) << "Model is not supported currently, model type: "
+               << model_type;
+  }
+  if (FLAGS_enable_prefill_sp &&
+      !prefill_sp_supported_model_set.contains(model_type)) {
+    LOG(FATAL) << "enable_prefill_sp is not supported for model_type="
+               << model_type;
+  }
+#if defined(USE_MLU)
+  // TODO: support other block sizes in the future
+  if (FLAGS_block_size != 16 && FLAGS_block_size != 1) {
+    LOG(FATAL) << "Currently, block_size must be 16 for MLU backend, we will "
+                  "support other block sizes in the future.";
+  }
+#endif
+
+#if defined(USE_NPU)
+  // enable_xtensor / enable_rolling_load imply enable_manual_loader
+  if ((FLAGS_enable_xtensor || FLAGS_enable_rolling_load) &&
+      !FLAGS_enable_manual_loader) {
+    LOG(WARNING) << "enable_xtensor or enable_rolling_load requires "
+                    "enable_manual_loader; forcing enable_manual_loader=true.";
+    FLAGS_enable_manual_loader = true;
+  }
+  if (FLAGS_enable_rolling_load && FLAGS_rolling_load_num_cached_layers < 1) {
+    LOG(FATAL) << "rolling_load_num_cached_layers must be >= 1.";
+  }
+  if (FLAGS_enable_rolling_load && FLAGS_rolling_load_num_rolling_slots < -1) {
+    LOG(FATAL) << "rolling_load_num_rolling_slots must be >= -1.";
+  }
+  if (FLAGS_enable_rolling_load && FLAGS_rolling_load_num_rolling_slots >= 0 &&
+      FLAGS_rolling_load_num_rolling_slots >
+          FLAGS_rolling_load_num_cached_layers) {
+    LOG(FATAL) << "rolling_load_num_rolling_slots must be <= "
+               << "rolling_load_num_cached_layers.";
+  }
+#else
+  if (FLAGS_enable_xtensor) {
+    LOG(FATAL) << "enable_xtensor is only supported on NPU.";
+  }
+  if (FLAGS_enable_manual_loader) {
+    LOG(FATAL) << "enable_manual_loader is only supported on NPU.";
+  }
+  if (FLAGS_enable_rolling_load) {
+    LOG(FATAL) << "enable_rolling_load is only supported on NPU.";
+  }
+#endif
+}
+
+int run() {
+  // check if model path exists
+  if (!std::filesystem::exists(FLAGS_model)) {
+    LOG(FATAL) << "Model path " << FLAGS_model << " does not exist.";
+  }
+
+  std::filesystem::path model_path =
+      std::filesystem::path(FLAGS_model).lexically_normal();
+
+  if (FLAGS_model_id.empty()) {
+    // use last part of the path as model id
+    if (model_path.has_filename()) {
+      FLAGS_model_id = std::filesystem::path(FLAGS_model).filename();
+    } else {
+      FLAGS_model_id =
+          std::filesystem::path(FLAGS_model).parent_path().filename();
+    }
+  }
+
+  if (FLAGS_backend.empty()) {
+    FLAGS_backend = get_model_backend(model_path);
+  }
+
+  if (FLAGS_host.empty()) {
+    // set the host to the local IP when the host is empty
+    FLAGS_host = net::get_local_ip_addr();
+  }
+
+  bool is_local = false;
+  if (FLAGS_host != "" &&
+      net::extract_ip(FLAGS_master_node_addr) == FLAGS_host) {
+    is_local = true;
+  } else {
+    is_local = false;
+  }
+
+  LOG(INFO) << "set worker role to "
+            << (is_local ? "local worker" : "remote worker");
+
+  if (FLAGS_backend == "vlm") {
+    FLAGS_enable_prefix_cache = false;
+    FLAGS_enable_chunked_prefill = false;
+  }
+
+  // if max_tokens_per_chunk_for_prefill is not set, set its value to
+  // max_tokens_per_batch
+  if (FLAGS_max_tokens_per_chunk_for_prefill < 0) {
+    FLAGS_max_tokens_per_chunk_for_prefill = FLAGS_max_tokens_per_batch;
+  }
+
+// disable block copy kernel on non-NPU backend
+#if !defined(USE_NPU)
+  FLAGS_enable_block_copy_kernel = false;
+#endif
+
+  std::string model_type = get_model_type(model_path);
+  // set enable_mla by model type
+  if (FLAGS_backend != "dit") {
+    FLAGS_enable_mla = janus::util::is_mla_model_type(model_type);
+  }
+  FLAGS_tool_call_parser = function_call::FunctionCallParser::get_parser_auto(
+      FLAGS_tool_call_parser, model_type);
+  FLAGS_reasoning_parser =
+      ReasoningParser::get_parser_auto(FLAGS_reasoning_parser, model_type);
+
+  // validate flags before creating master
+  validate_flags(model_type);
+
+  // Create Master
+  Options options;
+  options.model_path(FLAGS_model)
+      .model_id(FLAGS_model_id)
+      .task_type(FLAGS_task)
+      .devices(FLAGS_devices)
+      .draft_model_path(FLAGS_draft_model)
+      .draft_devices(FLAGS_draft_devices)
+      .backend(FLAGS_backend)
+      .limit_image_per_prompt(FLAGS_limit_image_per_prompt)
+      .block_size(FLAGS_block_size)
+      .max_cache_size(FLAGS_max_cache_size)
+      .max_memory_utilization(FLAGS_max_memory_utilization)
+      .enable_prefix_cache(FLAGS_enable_prefix_cache)
+      .max_tokens_per_batch(FLAGS_max_tokens_per_batch)
+      .max_seqs_per_batch(FLAGS_max_seqs_per_batch)
+      .max_tokens_per_chunk_for_prefill(FLAGS_max_tokens_per_chunk_for_prefill)
+      .num_speculative_tokens(FLAGS_num_speculative_tokens)
+      .speculative_algorithm(FLAGS_speculative_algorithm)
+      .speculative_suffix_cache_max_depth(
+          FLAGS_speculative_suffix_cache_max_depth)
+      .speculative_suffix_max_spec_factor(
+          FLAGS_speculative_suffix_max_spec_factor)
+      .speculative_suffix_max_spec_offset(
+          FLAGS_speculative_suffix_max_spec_offset)
+      .speculative_suffix_min_token_prob(
+          FLAGS_speculative_suffix_min_token_prob)
+      .speculative_suffix_max_cached_requests(
+          FLAGS_speculative_suffix_max_cached_requests)
+      .speculative_suffix_use_tree_spec(FLAGS_speculative_suffix_use_tree_spec)
+      .num_request_handling_threads(FLAGS_num_request_handling_threads)
+      .communication_backend(FLAGS_communication_backend)
+      .enable_eplb(FLAGS_enable_eplb)
+      .redundant_experts_num(FLAGS_redundant_experts_num)
+      .eplb_update_interval(FLAGS_eplb_update_interval)
+      .eplb_update_threshold(FLAGS_eplb_update_threshold)
+      .rank_tablefile(FLAGS_rank_tablefile)
+      .expert_parallel_degree(FLAGS_expert_parallel_degree)
+      .enable_mla(FLAGS_enable_mla)
+      .enable_chunked_prefill(FLAGS_enable_chunked_prefill)
+      .enable_prefill_sp(FLAGS_enable_prefill_sp)
+      .master_node_addr(FLAGS_master_node_addr)
+      .instance_role(InstanceRole(FLAGS_instance_role))
+      .device_ip("")
+      .transfer_listen_port(FLAGS_transfer_listen_port)
+      .nnodes(FLAGS_nnodes)
+      .node_rank(FLAGS_node_rank)
+      .dp_size(FLAGS_dp_size)
+      .ep_size(FLAGS_ep_size)
+      .instance_name(FLAGS_host + ":" + std::to_string(FLAGS_port))
+      .enable_disagg_pd(FLAGS_enable_disagg_pd)
+      .enable_pd_ooc(FLAGS_enable_pd_ooc)
+
+      .enable_schedule_overlap(FLAGS_enable_schedule_overlap)
+      .kv_cache_transfer_mode(FLAGS_kv_cache_transfer_mode)
+      .etcd_addr(FLAGS_etcd_addr)
+      .enable_service_routing(FLAGS_enable_service_routing ||
+                              FLAGS_enable_disagg_pd)
+      .tool_call_parser(FLAGS_tool_call_parser)
+      .reasoning_parser(FLAGS_reasoning_parser)
+      .priority_strategy(FLAGS_priority_strategy)
+      .enable_online_preempt_offline(FLAGS_enable_online_preempt_offline)
+      .enable_cache_upload(
+          (FLAGS_enable_service_routing || FLAGS_enable_disagg_pd) &&
+          FLAGS_enable_prefix_cache && FLAGS_enable_cache_upload)
+      .host_blocks_factor(FLAGS_host_blocks_factor)
+      .enable_kvcache_store(FLAGS_enable_kvcache_store &&
+                            FLAGS_enable_prefix_cache &&
+                            (FLAGS_host_blocks_factor > 1.0))
+      .prefetch_timeout(FLAGS_prefetch_timeout)
+      .prefetch_bacth_size(FLAGS_prefetch_bacth_size)
+      .layers_wise_copy_batchs(FLAGS_layers_wise_copy_batchs)
+      .store_protocol(FLAGS_store_protocol)
+      .store_master_server_address(FLAGS_store_master_server_address)
+      .store_metadata_server(FLAGS_store_metadata_server)
+      .store_local_hostname(FLAGS_store_local_hostname)
+      .enable_multi_stream_parallel(FLAGS_enable_multi_stream_parallel)
+      .enable_profile_step_time(FLAGS_enable_profile_step_time)
+      .enable_profile_token_budget(FLAGS_enable_profile_token_budget)
+      .enable_latency_aware_schedule(FLAGS_enable_latency_aware_schedule)
+      .profile_max_prompt_length(FLAGS_profile_max_prompt_length)
+      .enable_profile_kv_blocks(FLAGS_enable_profile_kv_blocks)
+      .disable_ttft_profiling(FLAGS_disable_ttft_profiling)
+      .enable_forward_interruption(FLAGS_enable_forward_interruption)
+      .enable_graph(FLAGS_enable_graph)
+      .max_global_ttft_ms(FLAGS_max_global_ttft_ms)
+      .max_global_tpot_ms(FLAGS_max_global_tpot_ms)
+      .max_requests_per_batch(FLAGS_max_requests_per_batch)
+      .enable_shm(FLAGS_enable_shm)
+      .input_shm_size(FLAGS_input_shm_size)
+      .output_shm_size(FLAGS_output_shm_size)
+      .beam_width(FLAGS_beam_width)
+      .kv_cache_dtype(FLAGS_kv_cache_dtype)
+      .rec_worker_max_concurrency(FLAGS_rec_worker_max_concurrency)
+      .is_local(is_local);
+
+  InstanceName::name()->set_name(options.instance_name().value_or(""));
+
+  // master node
+  // init XTensor allocator and PhyPagePool for xtensor mode
+  if (FLAGS_enable_xtensor) {
+    // Parse devices
+    const auto devices =
+        DeviceNameUtils::parse_devices(options.devices().value_or("auto"));
+
+    // Initialize XTensorAllocator with first device
+    auto& allocator = XTensorAllocator::get_instance();
+    allocator.init(devices[0]);
+
+    // Setup distributed XTensor service for multi-GPU/multi-node
+    if (FLAGS_nnodes > 1) {
+      xtensor::Options xtensor_options;
+      xtensor_options.devices(devices)
+          .nnodes(FLAGS_nnodes)
+          .node_rank(FLAGS_node_rank);
+      allocator.setup_multi_node_xtensor_dist(
+          xtensor_options, FLAGS_xtensor_master_node_addr, FLAGS_dp_size);
+    }
+
+    // Initialize PhyPagePool on all workers
+    int64_t num_pages = allocator.init_phy_page_pools(
+        FLAGS_max_memory_utilization, FLAGS_max_cache_size);
+    if (num_pages <= 0) {
+      LOG(FATAL) << "Failed to initialize PhyPagePool";
+    }
+    LOG(INFO) << "XTensor initialized with " << num_pages << " physical pages";
+  }
+
+  // Pre-bind the API port before any network activity to prevent the kernel
+  // from assigning it as an ephemeral source port for outgoing connections
+  // created during master initialization (WorkerService, CollectiveService,
+  // xservice heartbeat, mooncake sessions, etc.).
+  int reserved_port_fd = -1;
+  if (FLAGS_node_rank == 0 || FLAGS_enable_xtensor) {
+    reserved_port_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (reserved_port_fd >= 0) {
+      int opt = 1;
+      ::setsockopt(
+          reserved_port_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+      struct sockaddr_in bind_addr = {};
+      bind_addr.sin_family = AF_INET;
+      bind_addr.sin_addr.s_addr = INADDR_ANY;
+      bind_addr.sin_port = htons(FLAGS_port);
+      if (::bind(reserved_port_fd,
+                 (struct sockaddr*)&bind_addr,
+                 sizeof(bind_addr)) < 0) {
+        LOG(WARNING) << "Failed to pre-reserve API port " << FLAGS_port << ": "
+                     << strerror(errno);
+        ::close(reserved_port_fd);
+        reserved_port_fd = -1;
+      }
+    }
+  }
+
+  std::unique_ptr<Master> master;
+  // working node
+  if (options.node_rank() != 0) {
+    master = std::make_unique<LLMAssistantMaster>(options);
+  } else {
+    if (FLAGS_random_seed < 0) {
+      FLAGS_random_seed = std::random_device{}() % (1 << 30);
+    }
+    // master node
+    master = create_master(FLAGS_backend, options);
+  }
+  master->run();
+
+  // supported models
+  std::vector<std::string> model_names = {FLAGS_model_id};
+  std::string model_version;
+  if (model_path.has_filename()) {
+    model_version = std::filesystem::path(FLAGS_model).filename();
+  } else {
+    model_version = std::filesystem::path(FLAGS_model).parent_path().filename();
+  }
+  std::vector<std::string> model_versions = {model_version};
+
+  if (FLAGS_node_rank == 0 || FLAGS_enable_xtensor) {
+    // Release the pre-reserved port right before brpc binds it;
+    // SO_REUSEADDR on both our socket and brpc's socket eliminates
+    // the race between close() and brpc's bind().
+    if (reserved_port_fd >= 0) {
+      ::close(reserved_port_fd);
+      reserved_port_fd = -1;
+    }
+
+    auto api_service =
+        std::make_unique<APIService>(master.get(), model_names, model_versions);
+    auto janus_server =
+        ServerRegistry::get_instance().register_server("HttpServer");
+
+    // start brpc server
+    if (!janus_server->start(std::move(api_service))) {
+      LOG(ERROR) << "Failed to start brpc server on port " << FLAGS_port;
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  // Check for --help flag before parsing other flags
+  for (int i = 1; i < argc; ++i) {
+    std::string arg(argv[i]);
+    if (arg == "--help" || arg == "-h") {
+      HelpFormatter::print_help();
+      return 0;
+    }
+  }
+
+  FLAGS_alsologtostderr = true;
+  FLAGS_minloglevel = 0;
+  google::ParseCommandLineFlags(&argc, &argv, true);
+
+  google::InitGoogleLogging("janus");
+
+  // Check if model path is provided
+  if (FLAGS_model.empty()) {
+    HelpFormatter::print_error("--model flag is required");
+    return 1;
+  }
+
+  return run();
+}

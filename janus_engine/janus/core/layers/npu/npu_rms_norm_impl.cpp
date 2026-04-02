@@ -1,0 +1,86 @@
+#include "npu_rms_norm_impl.h"
+
+#include <glog/logging.h>
+
+namespace janus {
+namespace layer {
+
+void NpuRMSNormImpl::param_from_args(atb::infer::RmsNormParam& param,
+                                     const ModelArgs& args) {
+  param.layerType = atb::infer::RmsNormParam::RmsNormType::RMS_NORM_NORM;
+  param.normParam.epsilon = args.rms_norm_eps();
+}
+
+NpuRMSNormImpl::NpuRMSNormImpl(const ModelContext& context)
+    : BaseLayer(context) {
+  param_from_args(norm_param_, context.get_model_args());
+
+  atb_weight_tensors_.resize(1);
+
+  if (FLAGS_enable_manual_loader) {
+    loader_ = std::make_unique<RMSNormManualLoader>(1, context);
+    get_manual_loader()->set_pinned_host_cache_component_key("norm");
+  } else {
+    loader_ = std::make_unique<RMSNormLoader>(1, context);
+  }
+}
+
+int64_t NpuRMSNormImpl::init_layer() {
+  name_ = "rms_norm_layer";
+  model_name_ = "llm";
+  CHECK_OPERATION_STATUS_RETURN(init_node(norm_node_, norm_param_));
+
+  return atb::NO_ERROR;
+}
+
+int64_t NpuRMSNormImpl::init_node(atb_speed::Model::Node& node,
+                                  atb::infer::RmsNormParam& param) {
+  atb::Operation* operation = nullptr;
+  atb::Status atbStatus = atb::CreateOperation(param, &operation);
+  if (atbStatus != atb::NO_ERROR) {
+    return atbStatus;
+  }
+
+  node.operation.reset(operation);
+  if (node.operation == nullptr) {
+    LOG(ERROR) << "node.operation is null";
+    return -1;
+  }
+  if (node.operation->GetInputNum() < 1) {
+    LOG(ERROR) << "Can not resize number which is smaller than 1";
+    return -1;
+  }
+  node.inTensors.resize(node.operation->GetInputNum());
+  node.outTensors.resize(1);
+
+  node.inTensors.at(1) = &atb_weight_tensors_[0];
+  node.variantPack.inTensors.reserve(node.inTensors.size());
+  node.variantPack.inTensors.resize(node.inTensors.size());
+  node.variantPack.outTensors.reserve(1);
+  node.variantPack.outTensors.resize(1);
+
+  return atb::NO_ERROR;
+}
+
+torch::Tensor NpuRMSNormImpl::forward(torch::Tensor& x, int nodeId) {
+  atb::Status st;
+
+  build_node_variant_pack(norm_node_, x);
+  st = execute_node(norm_node_, nodeId);
+  LOG_IF(FATAL, st != 0) << model_name_
+                         << "infer shape fail, error code: " << st;
+
+  return x;
+}
+
+void NpuRMSNormImpl::build_node_variant_pack(atb_speed::Model::Node& node,
+                                             torch::Tensor& x) {
+  internal_tensors_ = atb_speed::Utils::AtTensor2Tensor(x);
+
+  node.variantPack.inTensors.at(0) = internal_tensors_;
+  node.variantPack.inTensors.at(1) = *node.inTensors.at(1);
+  node.variantPack.outTensors.at(0) = internal_tensors_;
+}
+
+}  // namespace layer
+}  // namespace janus

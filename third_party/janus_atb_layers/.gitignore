@@ -1,0 +1,14 @@
+# Visual Studio Code
+/.vscode*
+
+# CMake
+/build*
+
+# vcpkg
+/.vcpkg*
+
+# cache
+/.*cache
+
+# deps
+/.deps

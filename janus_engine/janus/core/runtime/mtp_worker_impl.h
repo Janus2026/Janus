@@ -1,0 +1,120 @@
+#pragma once
+
+#include "framework/kv_cache/embedding_cache.h"
+#if defined(USE_NPU)
+#include "framework/kv_cache/spec_kv_cache_transfer.h"
+#endif
+#include "runtime/speculative_worker_impl.h"
+
+namespace janus {
+
+#if defined(USE_NPU)
+using namespace llm_datadist;
+#endif
+
+// MTP (Multi-Token Prediction) speculative worker.
+// Uses a draft model to generate proposals, then validates with target model.
+// Eagle3WorkerImpl inherits from this class.
+class MTPWorkerImpl : public SpeculativeWorkerImpl {
+ public:
+  MTPWorkerImpl(const ParallelArgs& parallel_args,
+                const torch::Device& device,
+                const runtime::Options& options);
+
+  ~MTPWorkerImpl() override = default;
+
+ protected:
+  // For derived classes (e.g. Eagle3WorkerImpl) that need custom options for
+  // target and draft models. `options` is passed to WorkerImpl (preserves
+  // enable_schedule_overlap etc.), `target_options` / `draft_options` are used
+  // to create the respective workers.
+  MTPWorkerImpl(const ParallelArgs& parallel_args,
+                const torch::Device& device,
+                const runtime::Options& options,
+                const runtime::Options& target_options,
+                const runtime::Options& draft_options,
+                bool enable_opt_validate_probs = false);
+
+ public:
+  bool init_model(const std::string& model_weights_path,
+                  int32_t random_seed,
+                  MasterStatus master_status) override;
+
+  bool allocate_kv_cache(
+      const std::vector<std::vector<int64_t>>& kv_cache_shape) override;
+
+#if defined(USE_NPU)
+  bool allocate_kv_cache_with_transfer(
+      const std::vector<std::vector<int64_t>>& kv_cache_shape) override;
+#endif
+
+  ForwardInput update_input_by_last_step_output(ForwardInput& inputs) override;
+
+ protected:
+  std::optional<ForwardOutput> step_prefill(const ForwardInput& input) override;
+  std::optional<ForwardOutput> step_decode(const ForwardInput& inputs) override;
+  std::optional<ForwardOutput> step_empty(const ForwardInput& inputs) override;
+  std::optional<ForwardOutput> step_decode_single(const ForwardInput& input);
+  std::optional<ForwardOutput> step_decode_multi_step(
+      const ForwardInput& input);
+
+  ForwardOutput prepare_last_output_for_decode(const ForwardInput& input);
+  void fill_validate_input_from_draft_outputs(
+      const std::vector<ForwardOutput>& draft_outputs,
+      ForwardInput& validate_input);
+  std::optional<ForwardOutput> run_validate(
+      const ForwardInput& input,
+      const std::vector<ForwardOutput>& draft_outputs,
+      ForwardInput& validate_input);
+
+  virtual SampleOutput validate(const SamplingParameters& sampling_params,
+                                const std::vector<ForwardOutput>& draft_outputs,
+                                const ForwardOutput& target_output);
+
+  // Hook for algorithm-specific draft output post-processing during decode.
+  // Default MTP behavior may compress probs for validate.
+  virtual void process_draft_sample_output(SampleOutput& sample_output);
+
+  SampleOutput validate(const SamplingParameters& sampling_params,
+                        const torch::Tensor& draft_token_ids,
+                        const torch::Tensor& draft_probs,
+                        const ForwardOutput& target_output);
+
+  // PD separation: placeholder size for empty embedding slot. Default: 1x
+  // hidden_size. Eagle3 overrides to 3 * target_hidden_size.
+  virtual int64_t get_embedding_placeholder_size();
+
+  // prepare inputs for draft model at Prefill phase.
+  void prepare_prefill_inputs(const ForwardInput& inputs,
+                              ForwardInput& prefill_inputs);
+
+  // prepare inputs for draft model at Decode phase.
+  void prepare_draft_inputs(const ForwardInput& inputs,
+                            ForwardInput& draft_inputs,
+                            const int64_t offset,
+                            const torch::Device device);
+
+  // Build a 2-token-per-seq draft extend input in one batch.
+  void prepare_draft_extend_inputs(const ForwardInput& base_input,
+                                   const SampleOutput& validate_output,
+                                   ForwardInput& extend_input);
+
+  // Run one draft extend forward and write next-step seed into embedding cache.
+  void run_draft_extend(const ForwardInput& input,
+                        const SampleOutput& validate_output);
+
+ protected:
+  // Draft model worker
+  std::unique_ptr<LLMWorkerImpl> draft_impl_;
+
+  // Embedding cache for speculative decoding
+  std::shared_ptr<EmbeddingCache> embedding_cache_;
+
+  // Whether to use optimized draft_probs handling in validation.
+  bool enable_opt_validate_probs_ = false;
+
+#if defined(USE_NPU)
+  std::shared_ptr<SpecKVCacheTransfer> kv_cache_transfer_;
+#endif
+};
+}  // namespace janus

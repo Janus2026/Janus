@@ -1,0 +1,314 @@
+#include "disagg_pd_service_impl.h"
+
+#include <glog/logging.h>
+
+#include "common/global_flags.h"
+#include "common/types.h"
+#include "distributed_runtime/llm_engine.h"
+#include "framework/request/request_output.h"
+#include "scheduler/disagg_pd_scheduler.h"
+
+namespace janus {
+
+DisaggPDServiceImpl::DisaggPDServiceImpl(DisaggPDScheduler* scheduler,
+                                         Engine* engine)
+    : scheduler_(scheduler), engine_(engine) {
+  xservice_client_ = XServiceClient::get_instance();
+  if (!xservice_client_->initialize_done()) {
+    LOG(FATAL) << "XServiceClient not init.";
+    return;
+  }
+}
+
+std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
+    const proto::DisaggRequest& req) {
+  // create a new request
+  // TODO: Should to support best_of > 1 case, now we only consider
+  // to allocate blocks for the first sequence in the request.
+  // But request maybe expend_sequence in running stage.
+  std::string prompt = req.prompt();
+  std::vector<int> prompt_tokens(req.prompt_tokens().begin(),
+                                 req.prompt_tokens().end());
+
+  RequestSamplingParam sampling_param;
+  sampling_param.frequency_penalty = req.frequency_penalty();
+  sampling_param.presence_penalty = req.presence_penalty();
+  sampling_param.repetition_penalty = req.repetition_penalty();
+  sampling_param.temperature = req.temperature();
+  sampling_param.top_p = req.top_p();
+  sampling_param.top_k = req.top_k();
+  sampling_param.logprobs = req.logprobs();
+  sampling_param.top_logprobs = req.top_logprobs();
+  sampling_param.is_embeddings = req.is_embeddings();
+
+  SchedulerParam scheduler_param;
+  scheduler_param.offline = req.offline();
+  scheduler_param.priority = static_cast<janus::RequestPriority>(req.priority());
+  if (!req.offline()) {
+    scheduler_param.ttft_slo_ms = req.ttft_slo_ms();
+    scheduler_param.tpot_slo_ms = req.tpot_slo_ms();
+    scheduler_param.ttlt_slo_ms = req.ttlt_slo_ms();
+    scheduler_param.tpot_priority_weight = req.tpot_priority_weight();
+    scheduler_param.ttft_priority_weight = req.ttft_priority_weight();
+    scheduler_param.ttlt_priority_weight = req.ttlt_priority_weight();
+    scheduler_param.priority_weight = req.priority_weight();
+  }
+
+  std::unordered_set<int32_t> stop_tokens;
+  for (auto& stop_token_id : req.stop_token_ids()) {
+    stop_tokens.insert(stop_token_id);
+  }
+  std::vector<std::vector<int32_t>> stop_sequences;
+  for (auto& stop_sequence : req.stop_sequences()) {
+    auto stop_seq_tokens = std::vector<int32_t>(
+        stop_sequence.seq_tokens().begin(), stop_sequence.seq_tokens().end());
+    stop_sequences.push_back(std::move(stop_seq_tokens));
+  }
+  StoppingChecker stopping_checker(req.max_tokens(),
+                                   req.max_context_len(),
+                                   req.eos_token_id(),
+                                   req.ignore_eos(),
+                                   std::move(stop_tokens),
+                                   std::move(stop_sequences));
+
+  auto output_callback = [this](const RequestOutput& output) -> bool {
+    // response to janus service to avoid the redirect cost.
+    if (xservice_client_ == nullptr) return false;
+    auto return_status = xservice_client_->generations({output});
+    CHECK_EQ(return_status.size(), 1)
+        << "return size of generations is not equal to 1";
+    return return_status[0];
+  };
+
+  auto batch_output_callback =
+      [this](const std::vector<RequestOutput>& outputs) {
+        // response to janus service to avoid the redirect cost.
+        if (xservice_client_ == nullptr) {
+          return std::vector<bool>(outputs.size(), false);
+        }
+        return xservice_client_->generations(outputs);
+      };
+
+  RequestState req_state(std::move(prompt),
+                         std::move(prompt_tokens),
+                         std::move(sampling_param),
+                         std::move(scheduler_param),
+                         std::move(stopping_checker),
+                         req.seq_capacity(),
+                         req.n(),
+                         req.best_of(),
+                         req.logprobs(),
+                         req.stream(),
+                         req.echo(),
+                         req.skip_special_tokens(),
+                         scheduler_->enable_schedule_overlap(),
+                         output_callback,
+                         batch_output_callback);
+
+  auto new_request = std::make_shared<Request>(req.req_id(),
+                                               req.x_request_id(),
+                                               req.x_request_time(),
+                                               std::move(req_state),
+                                               req.service_req_id(),
+                                               req.source_xservice_addr());
+
+  // add one sequence, rest will be added by scheduler
+  return new_request;
+}
+
+void DisaggPDServiceImpl::decode_recv_new_requests(
+    const proto::DisaggRequests* request,
+    proto::DisaggResponses* response) {
+  JANUS_DLOG(INFO) << "[DIAG] decode_recv_new_requests: reqs_count="
+            << request->reqs_size();
+  for (auto& req : request->reqs()) {
+    auto resp = response->add_resps();
+    resp->set_req_id(req.req_id());
+
+    auto new_request = generate_request(req);
+    if (new_request == nullptr) {
+      JANUS_DLOG(ERROR) << "[DIAG] generate_request returned nullptr for " << req.req_id();
+      resp->set_status_code(500);
+      continue;
+    }
+
+    auto& sequences = new_request->sequences();
+    Sequence* sequence = sequences[0].get();
+
+    if (!scheduler_->try_allocate(sequence)) {
+      JANUS_DLOG(WARNING) << "[DIAG] try_allocate FAILED for " << req.req_id();
+      resp->set_status_code(404);
+    } else {
+      // push the request to scheduler request buffer
+      bool success =
+          scheduler_->decode_schedule(new_request, request->prefill_name());
+      if (!success) {
+        LOG(ERROR) << "Failed to schedule new decode instance request: "
+                   << req.req_id();
+        // request and blocks are released in scheduler
+        resp->set_status_code(500);
+        continue;
+      }
+
+      auto dp_rank = sequence->dp_rank();
+      resp->set_dp_rank(dp_rank);
+
+      size_t shared_num = sequence->kv_state().shared_kv_blocks_num();
+      auto blocks = sequence->kv_state().kv_blocks();
+
+      // Collect block IDs
+      std::vector<int32_t> block_ids;
+      block_ids.reserve(blocks.size() - shared_num);
+      for (size_t i = shared_num; i < blocks.size(); i++) {
+        int32_t block_id = blocks[i].id();
+        *(resp->mutable_blocks_ids()->Add()) = block_id;
+        block_ids.push_back(block_id);
+      }
+      // XTensor mode: calculate and return GlobalXTensor offsets
+      if (FLAGS_enable_xtensor && !block_ids.empty()) {
+        std::vector<XTensorLayerOffsets> layer_offsets;
+        XTensorBlockBytes block_bytes;
+        if (engine_->get_xtensor_offsets_for_blocks(
+                dp_rank, block_ids, layer_offsets, &block_bytes)) {
+          // Fill proto with per-layer offsets
+          for (const auto& layer_offsets_item : layer_offsets) {
+            auto* layer_proto = resp->add_xtensor_layer_offsets();
+            for (const auto& k_off : layer_offsets_item.k_offsets) {
+              layer_proto->add_k_offsets(k_off);
+            }
+            for (const auto& v_off : layer_offsets_item.v_offsets) {
+              layer_proto->add_v_offsets(v_off);
+            }
+            for (const auto& index_off : layer_offsets_item.index_offsets) {
+              layer_proto->add_index_offsets(index_off);
+            }
+          }
+          auto* block_bytes_proto = resp->mutable_xtensor_block_bytes();
+          block_bytes_proto->set_k_block_bytes(block_bytes.k_block_bytes);
+          block_bytes_proto->set_v_block_bytes(block_bytes.v_block_bytes);
+          block_bytes_proto->set_index_block_bytes(
+              block_bytes.index_block_bytes);
+          VLOG(5) << "XTensor offsets added for request " << req.req_id()
+                  << ", num_blocks=" << block_ids.size()
+                  << ", num_layers=" << layer_offsets.size();
+        } else {
+          LOG(WARNING) << "Failed to get XTensor offsets for request "
+                       << req.req_id();
+        }
+      }
+
+      resp->set_status_code(200);
+      JANUS_DLOG(INFO) << "[DIAG] decode_recv_new_requests: req " << req.req_id()
+                << " allocated, blocks=" << (blocks.size() - shared_num)
+                << ", dp_rank=" << dp_rank;
+    }
+  }
+}
+
+// TODO: support embedding later, now we only support tokens
+void DisaggPDServiceImpl::decode_recv_first_generation(
+    const proto::DisaggGenerationsRequests* request,
+    proto::Status* response) {
+  JANUS_DLOG(INFO) << "[DIAG] decode_recv_first_generation: multi_gens_count="
+            << request->multi_gens_size();
+  // TODO: we only support one request generation currently
+  for (auto& gen : request->multi_gens()) {
+    // Process the first token from the tokens array
+    if (gen.tokens().empty()) {
+      response->set_ok(false);
+      return;
+    }
+
+    const auto& first_token = gen.tokens(0);
+    std::vector<int64_t> top_tokens(first_token.top_tokens().begin(),
+                                    first_token.top_tokens().end());
+    std::vector<float> top_logprobs(first_token.top_logprobs().begin(),
+                                    first_token.top_logprobs().end());
+    std::vector<uint64_t> cluster_ids(gen.cluster_ids().begin(),
+                                      gen.cluster_ids().end());
+    std::vector<std::string> addrs(gen.addrs().begin(), gen.addrs().end());
+    std::vector<int64_t> k_cache_ids(gen.k_cache_ids().begin(),
+                                     gen.k_cache_ids().end());
+    std::vector<int64_t> v_cache_ids(gen.v_cache_ids().begin(),
+                                     gen.v_cache_ids().end());
+    std::vector<uint64_t> block_ids(gen.block_ids().begin(),
+                                    gen.block_ids().end());
+
+    bool success = scheduler_->decode_recv_first_generation(
+        gen.req_id(),
+        first_token.token_id(),
+        first_token.has_logprob(),
+        first_token.logprob(),
+        first_token.time_to_first_token_latency_seconds(),
+        std::move(top_tokens),
+        std::move(top_logprobs),
+        gen.kv_cache_transfer_mode(),
+        std::move(cluster_ids),
+        std::move(addrs),
+        std::move(k_cache_ids),
+        std::move(v_cache_ids),
+        std::move(block_ids),
+        gen.dp_size(),
+        gen.dp_rank());
+    if (!success) {
+      response->set_ok(false);
+      return;
+    }
+  }
+
+  response->set_ok(true);
+}
+
+void DisaggPDServiceImpl::link_instance(
+    const proto::InstanceClusterInfo* request,
+    proto::Status* response) {
+  // Extract parameters from proto request
+  std::vector<uint64_t> cluster_ids(request->cluster_ids().begin(),
+                                    request->cluster_ids().end());
+  std::vector<std::string> addrs(request->addrs().begin(),
+                                 request->addrs().end());
+  std::vector<std::string> device_ips(request->device_ips().begin(),
+                                      request->device_ips().end());
+  std::vector<uint16_t> ports(request->ports().begin(), request->ports().end());
+  int32_t dp_size = request->dp_size();
+
+  // Call scheduler's link_instance method
+  bool success = scheduler_->link_instance(
+      request->instance_name(), cluster_ids, addrs, device_ips, ports, dp_size);
+
+  if (!success) {
+    LOG(ERROR) << "Failed to link instance: " << request->instance_name();
+    response->set_ok(false);
+    return;
+  }
+
+  response->set_ok(true);
+}
+
+void DisaggPDServiceImpl::unlink_instance(
+    const proto::InstanceClusterInfo* request,
+    proto::Status* response) {
+  // Extract parameters from proto request
+  std::vector<uint64_t> cluster_ids(request->cluster_ids().begin(),
+                                    request->cluster_ids().end());
+  std::vector<std::string> addrs(request->addrs().begin(),
+                                 request->addrs().end());
+  std::vector<std::string> device_ips(request->device_ips().begin(),
+                                      request->device_ips().end());
+  std::vector<uint16_t> ports(request->ports().begin(), request->ports().end());
+  int32_t dp_size = request->dp_size();
+
+  // Call scheduler's unlink_instance method
+  bool success = scheduler_->unlink_instance(
+      request->instance_name(), cluster_ids, addrs, device_ips, ports, dp_size);
+
+  if (!success) {
+    LOG(ERROR) << "Failed to unlink instance: " << request->instance_name();
+    response->set_ok(false);
+    return;
+  }
+
+  response->set_ok(true);
+}
+
+}  // namespace janus

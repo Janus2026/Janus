@@ -1,0 +1,125 @@
+include(cc_library)
+
+if(USE_NPU OR USE_CUDA)
+  include_directories(
+    ${CMAKE_SOURCE_DIR}/../third_party/spdlog/include
+  )
+
+  add_subdirectory(spawn_worker_server)
+endif()
+
+cc_library(
+  NAME 
+    distributed_runtime
+  HDRS
+    engine.h
+    master.h
+    dit_engine.h
+    dit_master.h
+    llm_engine.h
+    llm_master.h
+    vlm_engine.h
+    vlm_master.h
+    speculative_engine.h
+    rec_engine.h
+    rec_master.h
+    disagg_pd_service.h
+    disagg_pd_service_impl.h
+    pd_ooc_service.h
+    pd_ooc_service_impl.h
+    dist_manager.h
+    remote_worker.h
+    worker_server.h
+    worker_service.h
+    comm_channel.h
+    shm_channel.h
+  SRCS
+    master.cpp
+    dit_engine.cpp
+    dit_master.cpp
+    llm_engine.cpp
+    llm_master.cpp
+    vlm_engine.cpp
+    vlm_master.cpp
+    speculative_engine.cpp
+    rec_engine.cpp
+    rec_master.cpp
+    disagg_pd_service.cpp
+    disagg_pd_service_impl.cpp
+    pd_ooc_service.cpp
+    pd_ooc_service_impl.cpp
+    dist_manager.cpp
+    remote_worker.cpp
+    worker_server.cpp
+    worker_service.cpp
+    comm_channel.cpp
+    shm_channel.cpp
+  DEPS
+    :api_service
+    :runtime
+    :util
+    glog::glog
+    proto::janus_proto
+    absl::flat_hash_set
+    :parallel_state
+    $<$<BOOL:${USE_NPU}>:janus_atb_layers>
+    :collective_service
+    :xtensor
+)
+
+cc_library(
+  NAME
+    worker_service
+  HDRS
+    worker_service.h
+  SRCS
+    worker_service.cpp
+  DEPS
+    :request
+    absl::strings
+    glog::glog
+    proto::janus_proto
+    :platform
+)
+
+cc_library(
+  NAME
+    collective_service
+  HDRS
+    collective_service.h
+  SRCS
+    collective_service.cpp
+  DEPS
+    absl::flat_hash_set
+    glog::glog
+    proto::janus_proto
+)
+
+target_link_libraries(worker_service PRIVATE brpc leveldb::leveldb protobuf::libprotobuf)
+
+cc_library(
+  NAME 
+    master
+  HDRS
+    llm_master.h
+    master.h
+    vlm_master.h
+    dit_master.h
+  SRCS
+    llm_master.cpp
+    master.cpp
+    vlm_master.cpp
+    dit_master.cpp
+  DEPS
+    :common
+    :distributed_runtime
+    :scheduler
+    :request
+    :runtime
+    :model
+    :models
+    $<$<BOOL:${USE_NPU}>:npu_layers>
+    :chat_template
+    glog::glog
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+)

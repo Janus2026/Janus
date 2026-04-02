@@ -1,0 +1,322 @@
+#include "distributed_runtime/dist_manager.h"
+
+#include <glog/logging.h>
+#include <stdexcept>
+
+#include "comm_channel.h"
+#include "common/health_check_manager.h"
+#include "distributed_runtime/collective_service.h"
+#include "framework/parallel_state/parallel_args.h"
+#include "framework/parallel_state/parallel_state.h"
+#include "framework/parallel_state/process_group.h"
+#if defined(USE_CUDA)
+#include "platform/numa_utils.h"
+#endif
+#include "remote_worker.h"
+#include "runtime/forward_shared_memory_manager.h"
+#include "runtime/llm_worker_impl.h"
+#include "server/janus_server_registry.h"
+#include "shm_channel.h"
+#include "util/net.h"
+namespace janus {
+
+DistManager::DistManager(const runtime::Options& options)
+    : server_name_("CollectiveServer") {
+  auto master_node_addr = options.master_node_addr().value_or("");
+  if (!master_node_addr.empty()) {
+    server_name_.append(std::to_string(options.server_idx()));
+    setup_multi_node_workers(options, master_node_addr);
+  } else {
+    LOG(FATAL) << "master_node_addr is empty.";
+  }
+}
+
+DistManager::~DistManager() {
+  // Stop health check
+  HealthCheckManager::instance().stop_health_check_thread();
+
+  JanusServer* collective_server =
+      ServerRegistry::get_instance().get_server(server_name_);
+  if (collective_server != nullptr) {
+    collective_server->stop();
+
+    ServerRegistry::get_instance().unregister_server(server_name_);
+  }
+
+  for (size_t i = 0; i < servers_.size(); ++i) {
+    servers_[i]->stop();
+  }
+}
+
+namespace {
+std::unique_ptr<CommChannel> create_channel(const std::string& worker_addrs,
+                                            int r,
+                                            int dp_local_tp_size,
+                                            const runtime::Options& options) {
+  std::unique_ptr<CommChannel> channel;
+
+  if (net::extract_ip(options.master_node_addr().value_or("")) ==
+          net::extract_ip(worker_addrs) &&
+      options.enable_shm()) {
+    // create shared memory manager for local rank
+    bool is_driver = false;
+    int dp_group = r / dp_local_tp_size;
+    if (r % dp_local_tp_size == 0) {
+      is_driver = true;
+    }
+    channel = std::make_unique<ShmChannel>(dp_group, r, is_driver, options);
+  } else {
+    channel = std::make_unique<CommChannel>();
+  }
+
+  channel->init_brpc(worker_addrs);
+
+  return channel;
+}
+
+#if defined(USE_CUDA)
+void setup_numa_affinity_and_isolation(
+    const runtime::Options& options,
+    std::vector<int32_t>& device_numa_nodes,
+    std::vector<bool>& force_spawn_for_numa_isolation) {
+  const auto& devices = options.devices();
+
+  device_numa_nodes.assign(devices.size(), -1);
+  force_spawn_for_numa_isolation.assign(devices.size(), false);
+
+  std::set<int32_t> unique_numa_nodes;
+  for (size_t i = 0; i < devices.size(); ++i) {
+    device_numa_nodes[i] = numa::get_device_numa_node(devices[i].index());
+    if (device_numa_nodes[i] >= 0) {
+      unique_numa_nodes.insert(device_numa_nodes[i]);
+    }
+
+    LOG(INFO) << "NUMA mapping: local rank " << i << ", device "
+              << devices[i].index() << " -> NUMA node " << device_numa_nodes[i];
+  }
+
+  int32_t engine_numa_node = -1;
+  for (auto numa_node : device_numa_nodes) {
+    if (numa_node >= 0) {
+      engine_numa_node = numa_node;
+      break;
+    }
+  }
+
+  if (engine_numa_node >= 0) {
+    if (numa::bind_process_to_numa_node(engine_numa_node) != 0) {
+      LOG(WARNING) << "Failed to pin engine process to NUMA node "
+                   << engine_numa_node
+                   << ", fallback to per-worker affinity only";
+    }
+
+    if (unique_numa_nodes.size() > 1) {
+      for (size_t i = 0; i < devices.size(); ++i) {
+        force_spawn_for_numa_isolation[i] =
+            (device_numa_nodes[i] >= 0 &&
+             device_numa_nodes[i] != engine_numa_node);
+      }
+      LOG(INFO) << "Detected multi-NUMA local devices. Workers outside NUMA "
+                << engine_numa_node
+                << " will be spawned as isolated processes to avoid engine "
+                   "process cross-NUMA spanning";
+    }
+  }
+}
+#endif
+
+}  // namespace
+
+void DistManager::setup_multi_node_workers(
+    const runtime::Options& options,
+    const std::string& master_node_addr) {
+  const auto& devices = options.devices();
+
+#if defined(USE_CUDA)
+  std::vector<int32_t> device_numa_nodes;
+  std::vector<bool> force_spawn_for_numa_isolation;
+  setup_numa_affinity_and_isolation(
+      options, device_numa_nodes, force_spawn_for_numa_isolation);
+#endif
+
+  // Process/Thread Worker Mode, we use it in multi-nodes serving.
+
+  // Here, we assume that all node use same index devices. That is, if we set
+  // device='1,2,3,4' and nnodes=2, then both machine nodes will use the
+  // devices '1,2,3,4'. Therefore, the total world size is 2 * 4 = 8. This
+  // means that each of the two nodes will utilize four devices (specifically
+  // devices 1, 2, 3, and 4), resulting in a total of 8 devices being used
+  // across the entire distributed setup.
+
+  // To maintain interface consistency, we have implemented a new WorkerImpl
+  // class. In this class, we create processes, initialize NCCL ProcessGroup,
+  // set up GRPC servers, and so on.
+
+  std::vector<std::atomic<bool>> dones(devices.size());
+  for (size_t i = 0; i < devices.size(); ++i) {
+    dones[i].store(false, std::memory_order_relaxed);
+  }
+
+  CHECK_GE(options.nnodes(), 1) << "At least one node is required";
+  CHECK_GE(options.node_rank(), 0) << "Node rank must >= 0.";
+  const int32_t each_node_ranks = static_cast<int32_t>(devices.size());
+  const int32_t world_size = each_node_ranks * options.nnodes();
+  const int32_t base_rank = options.node_rank() * each_node_ranks;
+  const int32_t dp_size = options.dp_size();
+  const int32_t ep_size = options.ep_size();
+  const int32_t dp_local_tp_size = world_size / dp_size;
+
+  LOG(INFO) << "Multi-node serving world_size = " << world_size
+            << ", each_node_ranks = " << each_node_ranks
+            << ", current node rank = " << options.node_rank()
+            << ", nnodes = " << options.nnodes() << ", dp_size = " << dp_size
+            << ", ep_size = " << ep_size << ", tp_size = " << dp_local_tp_size;
+
+  CHECK_EQ((world_size % dp_size), 0)
+      << "Global world size must be divisible by dp size in multi-node "
+         "serving mode.";
+
+  runtime::Options worker_server_options = options;
+  worker_server_options.world_size(world_size);
+  WorkerType worker_type("LLM");
+  const auto& model_backend = options.backend();
+  if (model_backend == "llm") {
+    if (options.task_type() == "generate") {
+      worker_type = WorkerType::LLM;
+    } else if (options.task_type() == "embed") {
+      worker_type = WorkerType::ELM;
+    } else {
+      LOG(FATAL) << "Unsupported " << options.task_type()
+                 << " for llm model backend";
+    }
+  } else if (model_backend == "vlm") {
+    if (options.task_type() == "generate") {
+      worker_type = WorkerType::VLM;
+    } else if (options.task_type() == "embed") {
+      worker_type = WorkerType::EVLM;
+    } else if (options.task_type() == "mm_embed") {
+      worker_type = WorkerType::MMEVLM;
+    } else {
+      LOG(FATAL) << "Unsupported " << options.task_type()
+                 << " for vlm model backend";
+    }
+  } else if (model_backend == "rec") {
+    worker_type = WorkerType::REC;
+  } else {
+    LOG(FATAL) << "Unsupported " << model_backend << " in multi-node.";
+  }
+  // For node_rank==0: start CollectiveServer FIRST so we know its actual
+  // port (OS-assigned) before creating workers that need to connect to it.
+  std::string actual_master_addr = master_node_addr;
+  std::shared_ptr<CollectiveService> collective_service;
+
+  if (options.node_rank() == 0) {
+    auto dp_local_process_group_num =
+        (dp_size > 1 && dp_size < world_size) ? dp_size : 0;
+
+    collective_service = std::make_shared<CollectiveService>(
+        dp_local_process_group_num, world_size, devices[0].index());
+    JanusServer* collective_server =
+        ServerRegistry::get_instance().register_server(server_name_);
+    if (!collective_server->start(
+            collective_service, master_node_addr, server_name_)) {
+      LOG(ERROR) << "Failed to start collective server on address: "
+                 << master_node_addr
+                 << ". Cannot proceed without distributed runtime.";
+      ServerRegistry::get_instance().unregister_server(server_name_);
+      throw std::runtime_error(
+          "CollectiveServer bind failed on " + master_node_addr);
+    }
+    actual_master_addr = collective_server->listen_address();
+    LOG(INFO) << "CollectiveServer actual address: " << actual_master_addr;
+  }
+
+  // create local workers (using the actual CollectiveServer address)
+  for (int32_t i = 0; i < each_node_ranks; ++i) {
+    const int32_t rank = i + base_rank;
+
+#if defined(USE_CUDA)
+    bool use_spawn_worker = (options.enable_offline_inference() && i > 0) ||
+                            force_spawn_for_numa_isolation[i];
+    if (force_spawn_for_numa_isolation[i]) {
+      LOG(INFO) << "Force spawn worker for local rank " << i << " (device "
+                << devices[i].index() << ", NUMA " << device_numa_nodes[i]
+                << ") to keep each process within a single NUMA region";
+    }
+#else
+    bool use_spawn_worker = options.enable_offline_inference() && i > 0;
+#endif
+    ParallelArgs parallel_args(rank, world_size, dp_size, nullptr, ep_size);
+
+    servers_.emplace_back(std::make_unique<WorkerServer>(i,
+                                                         actual_master_addr,
+                                                         dones[i],
+                                                         parallel_args,
+                                                         devices[i],
+                                                         worker_server_options,
+                                                         worker_type,
+                                                         use_spawn_worker));
+  }
+
+  // Master node: wait for all workers to connect
+  if (options.node_rank() == 0) {
+    // For TP>1 (nnodes>1), use a timeout shorter than janus-service's
+    // kForkTimeoutMs so we can clean up and propagate the error
+    // before the client gives up.  For nnodes==1 keep infinite wait.
+    const int wait_timeout_sec = (options.nnodes() > 1) ? 540 : 0;
+
+    std::unordered_map<int32_t, std::string> worker_addrs_map;
+    try {
+      worker_addrs_map = collective_service->wait(wait_timeout_sec);
+    } catch (...) {
+      LOG(ERROR) << "Worker connection wait failed for " << server_name_
+                 << ", cleaning up CollectiveServer and workers";
+      servers_.clear();
+      auto* cs = ServerRegistry::get_instance().get_server(server_name_);
+      if (cs) {
+        cs->stop();
+      }
+      ServerRegistry::get_instance().unregister_server(server_name_);
+      throw;
+    }
+
+    // check if all workers connected
+    // and then create worker clients
+    for (size_t r = 0; r < world_size; ++r) {
+      if (worker_addrs_map.find(r) == worker_addrs_map.end()) {
+        LOG(FATAL) << "Not all worker connect to engine server. Miss rank is "
+                   << r;
+        return;
+      }
+      auto channel =
+          create_channel(worker_addrs_map[r], r, dp_local_tp_size, options);
+      worker_clients_.emplace_back(
+          std::make_unique<RemoteWorker>(r,
+                                         worker_addrs_map[r],
+                                         devices[r % each_node_ranks],
+                                         std::move(channel)));
+    }
+
+    // Register health check for each worker and start background health check
+    for (auto& worker_client : worker_clients_) {
+      auto* remote_worker = dynamic_cast<RemoteWorker*>(worker_client.get());
+      if (remote_worker) {
+        int rank = remote_worker->global_rank();
+        HealthCheckManager::instance().register_health_check(
+            rank, [remote_worker]() { return remote_worker->check_health(); });
+      }
+    }
+    // Start background health check thread with 3(magic num) second interval
+    HealthCheckManager::instance().start_health_check_thread(
+        FLAGS_health_check_interval_ms);
+
+    LOG(INFO) << "Started cluster health check thread";
+  }
+
+  for (int idx = 0; idx < dones.size(); ++idx) {
+    while (!dones[idx].load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+}
+}  // namespace janus

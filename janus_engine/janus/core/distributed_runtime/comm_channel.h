@@ -1,0 +1,150 @@
+#pragma once
+
+#include <brpc/channel.h>
+#include <brpc/controller.h>
+#include <folly/futures/Future.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "common/types.h"
+#include "framework/xtensor/xtensor.h"
+#include "runtime/forward_params.h"
+#include "runtime/params_utils.h"
+#include "worker.pb.h"
+
+namespace janus {
+
+static constexpr size_t kKVCacheShapeSizeWithIndex = 3;
+static constexpr size_t kKVCacheShapeSizeWithConvAndSsm = 4;
+
+class CommChannel {
+ public:
+  CommChannel() = default;
+  virtual ~CommChannel() = default;
+
+  bool init_brpc(const std::string& server_address);
+
+  virtual bool hello();
+
+  virtual bool allocate_kv_cache(
+      const std::vector<std::vector<int64_t>>& kv_cache_shape);
+
+  virtual bool get_device_info(std::string& device_ip, uint16_t& port);
+
+  virtual bool get_p2p_addr(std::string& p2p_addr);
+
+  virtual bool get_cache_info(uint64_t& cluster_id,
+                              std::string& addr,
+                              int64_t& k_cache_id,
+                              int64_t& v_cache_id);
+
+  virtual bool link_cluster(const std::vector<uint64_t>& cluster_ids,
+                            const std::vector<std::string>& addrs,
+                            const std::vector<std::string>& device_ips,
+                            const std::vector<uint16_t>& ports);
+
+  virtual bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
+                              const std::vector<std::string>& addrs,
+                              const std::vector<std::string>& device_ips,
+                              const std::vector<uint16_t>& ports);
+
+  // D2D link for weight transfer
+  virtual bool link_d2d(const std::string& remote_addr);
+  virtual bool unlink_d2d(const std::string& remote_addr);
+
+  virtual bool init_model(const std::string& model_weights_path,
+                          int32_t random_seed,
+                          MasterStatus master_status);
+
+  virtual bool init_model_async(const std::string& model_weights_path,
+                                int32_t random_seed,
+                                folly::Promise<bool>& promise,
+                                MasterStatus master_status);
+
+  virtual bool estimate_kv_cache_capacity(int64_t& available_memory,
+                                          int64_t& total_memory);
+
+  virtual bool pull_kv_blocks(const uint64_t src_cluster_id,
+                              const std::string& src_addr,
+                              const int64_t src_k_cache_id,
+                              const int64_t src_v_cache_id,
+                              const std::vector<uint64_t>& src_blocks,
+                              const std::vector<uint64_t>& dst_blocks);
+
+  virtual void execute_model_async(
+      const RawForwardInput& input,
+      folly::Promise<std::optional<RawForwardOutput>>& promise);
+
+  virtual bool process_group_test();
+
+  virtual bool allocate_kv_cache_with_transfer(
+      const std::vector<std::vector<int64_t>>& kv_cache_shape);
+
+  virtual void transfer_kv_blocks(
+      const std::vector<BlockTransferInfo>& block_transfer_info,
+      folly::Promise<uint32_t>& promise);
+
+  virtual void transfer_kv_blocks(
+      const uint64_t batch_id,
+      const std::vector<BlockTransferInfo>& block_transfer_info);
+
+  virtual void prefetch_from_storage(
+      const std::vector<BlockTransferInfo>& block_transfer_info,
+      std::shared_ptr<std::atomic<int32_t>> flag,
+      std::shared_ptr<std::atomic<uint32_t>> success_cnt);
+
+  virtual bool get_last_step_result_async(
+      folly::Promise<std::optional<RawForwardOutput>>& promise);
+
+  virtual bool get_active_activation_memory(int64_t& memory);
+
+  virtual bool get_active_activation_memory_async(
+      folly::Promise<int64_t>& promise);
+
+  // Check if the connection to worker is healthy
+  virtual bool check_health();
+
+  virtual bool sleep(MasterStatus master_status);
+
+  virtual bool wakeup(const WakeupOptions& options);
+
+ protected:
+  bool execute_model_with_brpc(
+      const RawForwardInput& input,
+      folly::Promise<std::optional<RawForwardOutput>>& promise);
+
+ private:
+  brpc::Channel channel_;
+  brpc::ChannelOptions options_;
+  std::unique_ptr<proto::DistributeWorker_Stub> stub_;
+};
+
+class InitModelClosure : public google::protobuf::Closure {
+ public:
+  void Run();
+
+  proto::Status response;
+  brpc::Controller cntl;
+  folly::Promise<bool> promise;
+};
+
+class ExecuteModelClosure : public google::protobuf::Closure {
+ public:
+  void Run();
+
+  proto::ForwardOutput pb_output;
+  brpc::Controller cntl;
+  folly::Promise<std::optional<RawForwardOutput>> promise;
+};
+
+class TransferBlocksClosure : public google::protobuf::Closure {
+ public:
+  void Run();
+
+  proto::TransferStatus response;
+  brpc::Controller cntl;
+  folly::Promise<uint32_t> promise;
+};
+}  // namespace janus

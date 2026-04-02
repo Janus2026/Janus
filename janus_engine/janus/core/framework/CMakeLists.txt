@@ -1,0 +1,59 @@
+include(cc_library)
+include(cc_test)
+
+include_directories(.)
+if(USE_NPU)
+  include_directories(
+    ${CMAKE_SOURCE_DIR}/../third_party/spdlog/include
+  )
+endif()
+add_subdirectory(batch)
+add_subdirectory(xtensor)
+add_subdirectory(block)
+add_subdirectory(chat_template)
+add_subdirectory(kv_cache)
+add_subdirectory(model)
+add_subdirectory(parallel_state)
+add_subdirectory(prefix_cache)
+add_subdirectory(request)
+add_subdirectory(sampling)
+add_subdirectory(state_dict)
+add_subdirectory(tokenizer)
+add_subdirectory(eplb)
+add_subdirectory(dit_cache)
+
+
+cc_library(
+  NAME
+    model_loader
+  HDRS
+    hf_model_loader.h
+    dit_model_context.h
+    dit_model_loader.h
+    model_loader.h
+  SRCS
+    hf_model_loader.cpp
+    dit_model_context.cpp
+    dit_model_loader.cpp
+    model_loader.cpp
+  DEPS
+    :common
+    :model
+    :model_context
+    :models
+    $<$<BOOL:${USE_NPU}>:npu_layers>
+    :tokenizer
+    torch
+)
+
+cc_library(
+  NAME
+    model_context
+  HDRS
+    model_context.h
+  SRCS
+    model_context.cpp
+  DEPS
+    torch
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+)

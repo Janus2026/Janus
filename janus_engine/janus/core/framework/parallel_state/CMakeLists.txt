@@ -1,0 +1,59 @@
+include(cc_library)
+include(cc_test)
+
+cc_library(
+  NAME
+    parallel_state
+  HDRS
+    mapping_npu.h
+    parallel_args.h
+    parallel_state.h
+    process_group.h
+    $<$<BOOL:${USE_NPU}>:npu_process_group.h>
+    $<$<BOOL:${USE_MLU}>:mlu_process_group.h>
+    $<$<BOOL:${USE_MUSA}>:musa_process_group.h>
+    $<$<BOOL:${USE_CUDA}>:cuda_process_group.h>
+    $<$<BOOL:${USE_ILU}>:ilu_process_group.h>
+    collective_communicator.h
+  SRCS
+    mapping_npu.cpp
+    parallel_state.cpp
+    parallel_state_async.cpp
+    process_group.cpp
+    $<$<BOOL:${USE_NPU}>:npu_process_group.cpp>
+    collective_communicator.cpp
+  DEPS
+    :common
+    torch
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_MUSA}>:torch_musa>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    $<$<BOOL:${USE_NPU}>:hccl>
+    $<$<BOOL:${USE_NPU}>:hcomm>
+    $<$<BOOL:${USE_NPU}>:janus_atb_layers>
+    glog::glog
+)
+
+if(USE_NPU)
+  cc_test(
+    NAME
+      mapping_npu_test
+    SRCS
+      mapping_npu_test.cpp
+    DEPS
+      parallel_state
+      absl::synchronization
+      absl::time
+      GTest::gtest_main
+      janus_atb_layers
+      nnopbase
+      ascendcl
+      atb
+      c_sec
+      spdlog::spdlog
+  )
+endif()
+
+if(USE_MLU)
+  add_subdirectory(tests)
+endif()

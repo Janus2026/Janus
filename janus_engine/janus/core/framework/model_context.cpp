@@ -1,0 +1,77 @@
+#include "core/framework/model_context.h"
+
+#include <torch/torch.h>
+
+#include "platform/device.h"
+#if defined(USE_NPU)
+#ifdef TORCH_HIGHER_THAN_PTA6
+// #include <torch_npu/csrc/core/npu/NPUFormat.h>
+#include <torch_npu/csrc/framework/OpCommand.h>
+#else
+#include <torch_npu/csrc/aten/NPUNativeFunctions.h>
+#include <torch_npu/csrc/framework/utils/OpPreparation.h>
+#endif
+#include <torch_npu/csrc/libs/init_npu.h>
+#endif
+
+namespace janus {
+ModelContext::ModelContext(const ParallelArgs& input_parallel_args,
+                           const ModelArgs& model_args,
+                           const QuantArgs& quant_args,
+                           const torch::TensorOptions& tensor_options)
+    : parallel_args_(input_parallel_args),
+      model_args_(model_args),
+      quant_args_(quant_args),
+      tensor_options_(tensor_options) {
+#if defined(USE_NPU)
+  int32_t device_id = tensor_options.device().index();
+  aclError ret = aclrtSetDevice(device_id);
+  atb::CreateContext(&context_);
+  void* stream = c10_npu::getCurrentNPUStream(device_id).stream();
+  context_->SetExecuteStream(stream);
+  context_->SetAsyncTilingCopyStatus(true);
+  atb_workspace_ = std::make_shared<AtbWorkspace>(tensor_options.device());
+#endif
+  derive_optimization_config();
+}
+
+#if defined(USE_NPU)
+ModelContext::ModelContext(const ParallelArgs& input_parallel_args,
+                           const ModelArgs& model_args,
+                           const QuantArgs& quant_args,
+                           const torch::TensorOptions& tensor_options,
+                           atb::Context* context)
+    : parallel_args_(input_parallel_args),
+      model_args_(model_args),
+      quant_args_(quant_args),
+      tensor_options_(tensor_options),
+      context_(context) {}
+#endif
+
+void ModelContext::derive_optimization_config() {
+  // default disable fused kernel
+  optimization_config_.enable_fused_spec_kernel = false;
+  optimization_config_.enable_fused_mla_kernel = false;
+  optimization_config_.enable_fused_indexer_qk = false;
+
+  // determine whether to enable fused kernel based on backend
+  std::string backend = Device::type_str();
+  if (backend == "mlu") {
+    // TODO: enable fused spec kernel for mlu backend
+    // The current implementation of fused spec kernel is not stable.
+    optimization_config_.enable_fused_spec_kernel = false;
+    // fused mla only support smoothquant mode
+    // TODO: the fused kernel will support "glm_moe_dsa" model soon.
+    bool is_glm_moe_dsa =
+        model_args_.model_type().find("glm_moe_dsa") != std::string::npos;
+    optimization_config_.enable_fused_mla_kernel =
+        quant_args_.quant_method() == kQuantMethodSmoothquant &&
+        !is_glm_moe_dsa;
+    // TODO: enable fused indexer qk for mlu backend
+    // The current implementation of fused indexer qk is missing the
+    //  weights and bias loading.
+    optimization_config_.enable_fused_indexer_qk = !is_glm_moe_dsa;
+  }
+}
+
+}  // namespace janus

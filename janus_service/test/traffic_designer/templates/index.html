@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Traffic Curve Designer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 20px;
+            color: #333;
+        }
+        .panel {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .panel h2 {
+            font-size: 16px;
+            margin-bottom: 15px;
+            color: #555;
+        }
+        .model-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .model-item {
+            display: flex;
+            align-items: center;
+            padding: 8px 12px;
+            border-radius: 20px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 2px solid transparent;
+        }
+        .model-item:hover {
+            opacity: 0.8;
+        }
+        .model-item.selected {
+            border-color: #333;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+        .model-item .name {
+            margin-right: 8px;
+            font-weight: 500;
+        }
+        .model-item .delete-btn {
+            background: rgba(255,255,255,0.3);
+            border: none;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            line-height: 1;
+        }
+        .model-item .delete-btn:hover {
+            background: rgba(255,255,255,0.5);
+        }
+        .add-model {
+            display: flex;
+            gap: 10px;
+        }
+        .add-model input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .add-model button, .btn {
+            padding: 8px 16px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .add-model button:hover, .btn:hover {
+            background: #45a049;
+        }
+        .btn-secondary {
+            background: #2196F3;
+        }
+        .btn-secondary:hover {
+            background: #1976D2;
+        }
+        .btn-warning {
+            background: #ff9800;
+        }
+        .btn-warning:hover {
+            background: #f57c00;
+        }
+        .canvas-container {
+            position: relative;
+            background: #fafafa;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        #curveCanvas {
+            display: block;
+            cursor: crosshair;
+        }
+        .controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .control-group label {
+            font-size: 14px;
+            color: #666;
+        }
+        .control-group input {
+            width: 80px;
+            padding: 6px 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .file-path {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .file-path input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin-top: 10px;
+            display: none;
+        }
+        .status.success {
+            background: #e8f5e9;
+            color: #2e7d32;
+            display: block;
+        }
+        .status.error {
+            background: #ffebee;
+            color: #c62828;
+            display: block;
+        }
+        .legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            margin-top: 10px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 13px;
+        }
+        .legend-color {
+            width: 20px;
+            height: 3px;
+            border-radius: 2px;
+        }
+        .instructions {
+            font-size: 13px;
+            color: #666;
+            margin-top: 10px;
+            padding: 10px;
+            background: #fff3e0;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Traffic Curve Designer</h1>
+
+        <div class="panel">
+            <h2>Model List</h2>
+            <div class="model-list" id="modelList"></div>
+            <div class="add-model">
+                <input type="text" id="newModelName" placeholder="Enter model name (e.g., Qwen2-7B)">
+                <button onclick="addModel()">Add Model</button>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Traffic Curve Editor</h2>
+            <div class="controls">
+                <div class="control-group">
+                    <label>Duration (s):</label>
+                    <input type="number" id="duration" value="60" min="10" max="600" onchange="updateCanvas()">
+                </div>
+                <div class="control-group">
+                    <label>Max Rate (req/s):</label>
+                    <input type="number" id="maxRate" value="100" min="10" max="1000" onchange="updateCanvas()">
+                </div>
+                <button class="btn btn-warning" onclick="clearCurrentCurve()">Clear Current Curve</button>
+                <button class="btn btn-secondary" onclick="clearAllCurves()">Clear All Curves</button>
+            </div>
+            <div class="instructions">
+                <strong>Instructions:</strong> Select a model from the list above, then click and drag on the canvas to draw its traffic curve.
+                X-axis represents time (seconds), Y-axis represents request rate (requests per second).
+            </div>
+            <div class="canvas-container">
+                <canvas id="curveCanvas" width="1100" height="400"></canvas>
+            </div>
+            <div class="legend" id="legend"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Save / Load Configuration</h2>
+            <div class="file-path">
+                <label>File Path:</label>
+                <input type="text" id="filePath" value="traffic_config.pkl">
+            </div>
+            <div class="actions">
+                <button class="btn" onclick="saveConfig()">Save Configuration</button>
+                <button class="btn btn-secondary" onclick="loadConfig()">Load Configuration</button>
+            </div>
+            <div class="status" id="status"></div>
+        </div>
+    </div>
+
+    <script>
+        // Model colors (up to 10 models)
+        const COLORS = [
+            '#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6',
+            '#1abc9c', '#e91e63', '#00bcd4', '#ff5722', '#607d8b'
+        ];
+
+        // State
+        let models = ['Qwen2-7B', 'Qwen3-4B', 'Qwen3-8B', 'Qwen2.5-14B'];
+        let selectedModel = models[0];
+        let curves = {};  // model -> array of {x, y} points (normalized 0-1)
+
+        const canvas = document.getElementById('curveCanvas');
+        const ctx = canvas.getContext('2d');
+        let isDrawing = false;
+        let lastPoint = null;
+
+        // Canvas margins for axes
+        const MARGIN = { left: 60, right: 20, top: 20, bottom: 40 };
+
+        function init() {
+            models.forEach(m => curves[m] = []);
+            renderModelList();
+            updateCanvas();
+            setupCanvasEvents();
+        }
+
+        function getModelColor(model) {
+            const idx = models.indexOf(model);
+            return COLORS[idx % COLORS.length];
+        }
+
+        function renderModelList() {
+            const container = document.getElementById('modelList');
+            container.innerHTML = '';
+            models.forEach((model, idx) => {
+                const color = getModelColor(model);
+                const div = document.createElement('div');
+                div.className = 'model-item' + (model === selectedModel ? ' selected' : '');
+                div.style.backgroundColor = color;
+                div.style.color = 'white';
+                div.innerHTML = `
+                    <span class="name">${model}</span>
+                    <button class="delete-btn" onclick="event.stopPropagation(); deleteModel('${model}')">×</button>
+                `;
+                div.onclick = () => selectModel(model);
+                container.appendChild(div);
+            });
+            renderLegend();
+        }
+
+        function renderLegend() {
+            const container = document.getElementById('legend');
+            container.innerHTML = '';
+            models.forEach(model => {
+                const color = getModelColor(model);
+                const div = document.createElement('div');
+                div.className = 'legend-item';
+                div.innerHTML = `<div class="legend-color" style="background:${color}"></div><span>${model}</span>`;
+                container.appendChild(div);
+            });
+        }
+
+        function selectModel(model) {
+            selectedModel = model;
+            renderModelList();
+        }
+
+        function addModel() {
+            const input = document.getElementById('newModelName');
+            const name = input.value.trim();
+            if (!name) return;
+            if (models.includes(name)) {
+                showStatus('Model already exists', 'error');
+                return;
+            }
+            models.push(name);
+            curves[name] = [];
+            selectedModel = name;
+            input.value = '';
+            renderModelList();
+            updateCanvas();
+        }
+
+        function deleteModel(model) {
+            if (models.length <= 1) {
+                showStatus('Cannot delete the last model', 'error');
+                return;
+            }
+            models = models.filter(m => m !== model);
+            delete curves[model];
+            if (selectedModel === model) {
+                selectedModel = models[0];
+            }
+            renderModelList();
+            updateCanvas();
+        }
+
+        function getCanvasCoords(e) {
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: e.clientX - rect.left,
+                y: e.clientY - rect.top
+            };
+        }
+
+        function canvasToNormalized(x, y) {
+            const plotWidth = canvas.width - MARGIN.left - MARGIN.right;
+            const plotHeight = canvas.height - MARGIN.top - MARGIN.bottom;
+            return {
+                x: Math.max(0, Math.min(1, (x - MARGIN.left) / plotWidth)),
+                y: Math.max(0, Math.min(1, 1 - (y - MARGIN.top) / plotHeight))
+            };
+        }
+
+        function normalizedToCanvas(nx, ny) {
+            const plotWidth = canvas.width - MARGIN.left - MARGIN.right;
+            const plotHeight = canvas.height - MARGIN.top - MARGIN.bottom;
+            return {
+                x: MARGIN.left + nx * plotWidth,
+                y: MARGIN.top + (1 - ny) * plotHeight
+            };
+        }
+
+        function setupCanvasEvents() {
+            canvas.addEventListener('mousedown', (e) => {
+                isDrawing = true;
+                const coords = getCanvasCoords(e);
+                const norm = canvasToNormalized(coords.x, coords.y);
+
+                // Start new curve from this point
+                if (!curves[selectedModel]) curves[selectedModel] = [];
+                curves[selectedModel].push(norm);
+                lastPoint = norm;
+                updateCanvas();
+            });
+
+            canvas.addEventListener('mousemove', (e) => {
+                if (!isDrawing) return;
+                const coords = getCanvasCoords(e);
+                const norm = canvasToNormalized(coords.x, coords.y);
+
+                // Only add point if x increased (left to right drawing)
+                if (lastPoint && norm.x > lastPoint.x) {
+                    curves[selectedModel].push(norm);
+                    lastPoint = norm;
+                    updateCanvas();
+                }
+            });
+
+            canvas.addEventListener('mouseup', () => {
+                isDrawing = false;
+                lastPoint = null;
+                // Sort points by x coordinate
+                if (curves[selectedModel]) {
+                    curves[selectedModel].sort((a, b) => a.x - b.x);
+                }
+                updateCanvas();
+            });
+
+            canvas.addEventListener('mouseleave', () => {
+                isDrawing = false;
+                lastPoint = null;
+            });
+        }
+
+        function updateCanvas() {
+            const duration = parseInt(document.getElementById('duration').value) || 60;
+            const maxRate = parseInt(document.getElementById('maxRate').value) || 100;
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Draw background
+            ctx.fillStyle = '#fafafa';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const plotWidth = canvas.width - MARGIN.left - MARGIN.right;
+            const plotHeight = canvas.height - MARGIN.top - MARGIN.bottom;
+
+            // Draw grid
+            ctx.strokeStyle = '#e0e0e0';
+            ctx.lineWidth = 1;
+
+            // Vertical grid lines (time)
+            const xStep = duration <= 60 ? 5 : (duration <= 120 ? 10 : 30);
+            for (let t = 0; t <= duration; t += xStep) {
+                const x = MARGIN.left + (t / duration) * plotWidth;
+                ctx.beginPath();
+                ctx.moveTo(x, MARGIN.top);
+                ctx.lineTo(x, MARGIN.top + plotHeight);
+                ctx.stroke();
+            }
+
+            // Horizontal grid lines (rate)
+            const yStep = maxRate <= 100 ? 10 : (maxRate <= 500 ? 50 : 100);
+            for (let r = 0; r <= maxRate; r += yStep) {
+                const y = MARGIN.top + (1 - r / maxRate) * plotHeight;
+                ctx.beginPath();
+                ctx.moveTo(MARGIN.left, y);
+                ctx.lineTo(MARGIN.left + plotWidth, y);
+                ctx.stroke();
+            }
+
+            // Draw axes
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(MARGIN.left, MARGIN.top);
+            ctx.lineTo(MARGIN.left, MARGIN.top + plotHeight);
+            ctx.lineTo(MARGIN.left + plotWidth, MARGIN.top + plotHeight);
+            ctx.stroke();
+
+            // Draw axis labels
+            ctx.fillStyle = '#333';
+            ctx.font = '12px sans-serif';
+            ctx.textAlign = 'center';
+
+            // X-axis labels
+            for (let t = 0; t <= duration; t += xStep) {
+                const x = MARGIN.left + (t / duration) * plotWidth;
+                ctx.fillText(t + 's', x, MARGIN.top + plotHeight + 20);
+            }
+
+            // Y-axis labels
+            ctx.textAlign = 'right';
+            for (let r = 0; r <= maxRate; r += yStep) {
+                const y = MARGIN.top + (1 - r / maxRate) * plotHeight;
+                ctx.fillText(r, MARGIN.left - 10, y + 4);
+            }
+
+            // Axis titles
+            ctx.font = '14px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('Time (s)', MARGIN.left + plotWidth / 2, canvas.height - 5);
+
+            ctx.save();
+            ctx.translate(15, MARGIN.top + plotHeight / 2);
+            ctx.rotate(-Math.PI / 2);
+            ctx.fillText('Request Rate (req/s)', 0, 0);
+            ctx.restore();
+
+            // Draw all curves
+            models.forEach((model, idx) => {
+                const points = curves[model];
+                if (!points || points.length < 2) return;
+
+                const color = getModelColor(model);
+                ctx.strokeStyle = color;
+                ctx.lineWidth = model === selectedModel ? 3 : 2;
+                ctx.globalAlpha = model === selectedModel ? 1 : 0.6;
+
+                ctx.beginPath();
+                const start = normalizedToCanvas(points[0].x, points[0].y);
+                ctx.moveTo(start.x, start.y);
+
+                for (let i = 1; i < points.length; i++) {
+                    const pt = normalizedToCanvas(points[i].x, points[i].y);
+                    ctx.lineTo(pt.x, pt.y);
+                }
+                ctx.stroke();
+
+                // Draw points
+                ctx.fillStyle = color;
+                points.forEach(p => {
+                    const pt = normalizedToCanvas(p.x, p.y);
+                    ctx.beginPath();
+                    ctx.arc(pt.x, pt.y, model === selectedModel ? 4 : 3, 0, Math.PI * 2);
+                    ctx.fill();
+                });
+
+                ctx.globalAlpha = 1;
+            });
+        }
+
+        function clearCurrentCurve() {
+            if (selectedModel && curves[selectedModel]) {
+                curves[selectedModel] = [];
+                updateCanvas();
+            }
+        }
+
+        function clearAllCurves() {
+            models.forEach(m => curves[m] = []);
+            updateCanvas();
+        }
+
+        function showStatus(message, type) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = 'status ' + type;
+            setTimeout(() => { status.className = 'status'; }, 3000);
+        }
+
+        function saveConfig() {
+            const duration = parseInt(document.getElementById('duration').value) || 60;
+            const maxRate = parseInt(document.getElementById('maxRate').value) || 100;
+            const filePath = document.getElementById('filePath').value;
+
+            const config = {
+                models: models,
+                curves: curves,
+                duration: duration,
+                max_rate: maxRate,
+                save_path: filePath
+            };
+
+            fetch('/api/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    showStatus('Configuration saved to ' + data.path, 'success');
+                } else {
+                    showStatus('Save failed: ' + data.error, 'error');
+                }
+            })
+            .catch(err => showStatus('Save failed: ' + err, 'error'));
+        }
+
+        function loadConfig() {
+            const filePath = document.getElementById('filePath').value;
+
+            fetch('/api/load', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ load_path: filePath })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    const config = data.config;
+                    models = config.models || [];
+                    curves = config.curves || {};
+                    selectedModel = models[0] || '';
+                    document.getElementById('duration').value = config.duration || 60;
+                    document.getElementById('maxRate').value = config.max_rate || 100;
+                    renderModelList();
+                    updateCanvas();
+                    showStatus('Configuration loaded successfully', 'success');
+                } else {
+                    showStatus('Load failed: ' + data.error, 'error');
+                }
+            })
+            .catch(err => showStatus('Load failed: ' + err, 'error'));
+        }
+
+        // Initialize on load
+        init();
+    </script>
+</body>
+</html>

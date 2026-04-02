@@ -1,0 +1,571 @@
+#include "indexer.h"
+
+#include <glog/logging.h>
+#include <torch/torch.h>
+
+#include <cmath>
+
+#include "kernels/ops_api.h"
+
+namespace {
+
+// Returns true if n is a power of two (greater than 0 and only one bit set)
+inline bool is_power_of_two(int64_t n) { return n > 0 && ((n & (n - 1)) == 0); }
+
+// Generates an n×n Hadamard matrix (Sylvester type, elements ±1).
+// If normalize = true, returns orthogonal Hadamard: H / sqrt(n).
+torch::Tensor create_hadamard_matrix(int64_t n,
+                                     torch::Dtype dtype = torch::kFloat32,
+                                     torch::Device device = torch::kCPU,
+                                     bool normalize = false) {
+  CHECK(is_power_of_two(n)) << "hadamard_matrix: n must be a power of two.";
+
+  auto options = torch::TensorOptions().dtype(dtype).device(device);
+  // Initial Hadamard matrix H_1 = [1]
+  torch::Tensor H = torch::ones({1, 1}, options);
+
+  // Recursively build Hadamard: H_{2m} = [[H_m,  H_m], [H_m, -H_m]]
+  for (int64_t m = 1; m < n; m <<= 1) {
+    // Concatenate along column (dim=1) for top and bottom blocks
+    auto top = torch::cat({H, H}, /*dim=*/1);
+    auto bottom = torch::cat({H, -H}, /*dim=*/1);
+    // Concatenate along row (dim=0) to form next Hadamard matrix
+    H = torch::cat({top, bottom}, /*dim=*/0);
+  }
+
+  if (normalize) {
+    H = H / std::sqrt(static_cast<double>(n));
+  }
+  return H;
+}
+
+// Performs a Hadamard-like linear transform with optional zero-padding and
+// scaling.
+//
+// Args:
+//   x: Tensor of shape (..., dim)
+//   h_matrix: Tensor of shape (dim_padded, dim_padded). Treated as
+//   [out_features, in_features], matching Python F.linear weight convention.
+//   scale: Optional multiplicative scaling factor (default = 1.0). By default,
+//   no scaling is applied (matches Python version).
+//
+// Returns:
+//   Tensor of same shape as x, after transformation.
+torch::Tensor hadamard_transform_ref(const torch::Tensor& x,
+                                     const torch::Tensor& h_matrix) {
+  // Save original shape and input dimension
+  const auto x_shape = x.sizes();
+  const int64_t dim = x.size(-1);
+  // Flatten x to 2D of shape [-1, dim]
+  torch::Tensor x2d = x.reshape({-1, dim});
+  // Compute next power of two for padding
+  const double log_dim = std::ceil(std::log2(static_cast<double>(dim)));
+  // 2 ** log_dim
+  const int64_t dim_padded =
+      static_cast<int64_t>(1ull << static_cast<uint64_t>(log_dim));
+  // Pad the last dimension with zeros on the right to reach dim_padded if
+  // necessary
+  if (dim != dim_padded) {
+    // Padding order: [pad_left_dim, pad_right_dim, ...], applied from last
+    // dimension backwards
+    x2d = torch::nn::functional::pad(
+        x2d,
+        torch::nn::functional::PadFuncOptions({0, dim_padded - dim})
+            .mode(torch::kConstant)
+            .value(0));
+  }
+  // Linear transformation: F.linear(input, weight) with no bias
+  // weight should have shape [out_features, in_features]; so out = x2d @
+  // h_matrix.T
+  torch::Tensor out = torch::nn::functional::linear(x2d, h_matrix);
+
+  // Truncate result to original dim (last dimension)
+  using torch::indexing::Slice;
+  out = out.index({Slice(), Slice(0, dim)});
+  // Restore original shape
+  return out.reshape(x_shape);
+}
+}  // namespace
+
+namespace janus {
+namespace layer {
+
+IndexerImpl::IndexerImpl(int64_t dim,
+                         int64_t index_n_heads,
+                         int64_t index_head_dim,
+                         int64_t qk_rope_head_dim,
+                         int64_t index_topk,
+                         int64_t q_lora_rank,
+                         bool enable_fused_qk,
+                         const std::shared_ptr<RotaryEmbeddingBase>& rotary_emb,
+                         const QuantArgs& quant_args,
+                         const ParallelArgs& parallel_args,
+                         const torch::TensorOptions& options)
+    : n_heads_(index_n_heads),
+      head_dim_(index_head_dim),
+      rope_head_dim_(qk_rope_head_dim),
+      index_topk_(index_topk),
+      rotary_emb_(rotary_emb),
+      softmax_scale_(std::pow(head_dim_, -0.5) * std::pow(n_heads_, -0.5)),
+      enable_fused_qk_(enable_fused_qk) {
+  // Note: The current Indexer implementation does not yet support quantization
+  // or parallelization strategies. These features are planned for future
+  // updates. For now, the entire indexer computation runs independently on each
+  // MLU on any parallel strategy.
+  (void)parallel_args;
+
+  // Register modules
+  wq_b_ = register_module("wq_b",
+                          ReplicatedLinear(q_lora_rank,
+                                           n_heads_ * head_dim_,
+                                           /*bias=*/false,
+                                           quant_args,
+                                           options));
+  wk_ = register_module("wk",
+                        ReplicatedLinear(dim,
+                                         head_dim_,
+                                         /*bias=*/false,
+                                         quant_args,
+                                         options));
+
+  weights_proj_ = register_module("weights_proj",
+                                  ReplicatedLinear(dim,
+                                                   n_heads_,
+                                                   /*bias=*/false,
+                                                   quant_args,
+                                                   options));
+
+  // the default eps is defined as 1e-6 in indexer implementation of
+  // DeepSeek-V3.2.
+  double default_eps = 1e-6;
+  k_norm_ = register_module(
+      "k_norm",
+      RMSNorm(head_dim_, default_eps, options.dtype(torch::kFloat32)));
+  k_norm_->set_layernorm_mode();
+
+  // Create hadamard matrix
+  int64_t head_dim_padded = std::pow(2, std::ceil(std::log2(head_dim_)));
+  // Construct the Hadamard matrix on CPU with float32, then cast to target
+  // dtype and device set normalize=true is equivalent to scale=hidden_size **
+  // -0.5
+  hadamard_matrix_ = create_hadamard_matrix(
+      head_dim_padded, torch::kFloat32, torch::kCPU, true);
+  hadamard_matrix_ =
+      hadamard_matrix_.to(options.device(), options.dtype().toScalarType());
+
+  // indexer config
+  // TODO: this part should be obtained via model config instead
+  q_rope_at_front_ = true;
+}
+
+torch::Tensor IndexerImpl::rotate_activation(
+    const torch::Tensor& input,
+    const torch::Tensor& hadamard_matrix) {
+  // Ensure the input is bfloat16 as per interface contract
+  CHECK(input.dtype() == torch::kBFloat16)
+      << "rotate_activation: input must be bfloat16";
+  return hadamard_transform_ref(input, hadamard_matrix);
+}
+
+IndexerRuntimeContext IndexerImpl::prepare_runtime_context(
+    const torch::Tensor& k_current_dense,
+    torch::Tensor& k_cache_paged,
+    torch::Tensor& q,
+    torch::Tensor& weights,
+    const AttentionMetadata& attn_metadata,
+    bool is_prefill,
+    int64_t num_tokens) {
+  IndexerRuntimeContext ctx;
+  auto device = attn_metadata.block_table.device();
+
+  // Allocate context_lens buffer
+  ctx.new_context_lens = torch::empty(
+      {num_tokens}, torch::TensorOptions().dtype(torch::kInt32).device(device));
+
+  if (is_prefill) {
+    // Prefill: flatten Q and weights
+    ctx.q = q;
+    ctx.weights = weights;
+    ctx.cu_seq_q_lens = attn_metadata.q_cu_seq_lens;
+    ctx.k_block_table = std::nullopt;
+
+    ctx.new_block_tables = torch::empty(
+        {num_tokens, index_topk_},
+        torch::TensorOptions().dtype(torch::kInt32).device(device));
+
+    if (attn_metadata.is_chunked_prefill) {
+      // NOTE: the kv_cu_seq_lens should already include the history tokens
+      ctx.cu_seq_k_lens = attn_metadata.kv_cu_seq_lens;
+
+      // Allocate contiguous memory for gathered k
+      int64_t total_k_len = ctx.cu_seq_k_lens[-1].item<int64_t>();
+      ctx._storage_k_full = torch::empty(
+          {total_k_len, head_dim_},
+          torch::TensorOptions().dtype(k_cache_paged.dtype()).device(device));
+
+      // Calculate sequence lengths by diff of offsets
+      auto seq_lens = torch::diff(ctx.cu_seq_k_lens);
+      int64_t max_context_len = attn_metadata.max_seq_len;
+      ;
+
+      ctx.k_context_lens = seq_lens;
+
+      // Gather k from cache
+      janus::kernel::ReshapeFromCacheParams gather_params;
+      gather_params.key = ctx._storage_k_full.unsqueeze(1);
+      gather_params.value = std::nullopt;
+      gather_params.key_cache = k_cache_paged;
+      gather_params.value_cache = std::nullopt;
+      gather_params.context_lengths = seq_lens;
+      gather_params.max_context_len = max_context_len;
+      gather_params.block_tables = attn_metadata.block_table;
+      gather_params.context_seq_offset = std::nullopt;
+      gather_params.cache_seq_offset = std::nullopt;
+
+      janus::kernel::reshape_from_cache(gather_params);
+      ctx.k_cache_tensor = ctx._storage_k_full;
+    } else {
+      // Standard prefill: k is dense
+      ctx.cu_seq_k_lens = attn_metadata.q_cu_seq_lens;
+      ctx.k_context_lens = attn_metadata.kv_seq_lens;
+      ctx.k_cache_tensor = k_current_dense;
+    }
+  } else {
+    // Decode mode
+    int64_t batch_size = attn_metadata.kv_seq_lens.size(0);
+    auto seq_len = num_tokens / batch_size;
+
+    // Reshape q and weights for decode
+    ctx.q = q.view({batch_size, seq_len, n_heads_, head_dim_});
+    ctx.weights = weights.view({batch_size, seq_len, n_heads_});
+
+    ctx.new_block_tables = torch::empty(
+        {batch_size, seq_len, index_topk_},
+        torch::TensorOptions().dtype(torch::kInt32).device(device));
+
+    ctx.cu_seq_q_lens = std::nullopt;
+    ctx.cu_seq_k_lens = attn_metadata.q_cu_seq_lens;
+    ctx.k_block_table = attn_metadata.block_table;
+    ctx.k_cache_tensor = k_cache_paged;
+    ctx.k_context_lens = attn_metadata.kv_seq_lens;
+  }
+
+  return ctx;
+}
+
+torch::Tensor IndexerImpl::preprocess_indexer_q(
+    const torch::Tensor& q_norm,
+    const torch::Tensor& positions,
+    const AttentionMetadata& attn_metadata) {
+  // Forward pass through wq_b
+  auto q = wq_b_->forward(q_norm);
+  q = q.view({q.size(0), n_heads_, head_dim_});
+  auto q_pe = q.slice(-1, 0, rope_head_dim_);
+  rotary_emb_->forward(q_pe,
+                       positions,
+                       attn_metadata.q_cu_seq_lens,
+                       attn_metadata.max_query_len,
+                       attn_metadata.is_prefill);
+
+  // Apply rotation activation
+  q = rotate_activation(q, hadamard_matrix_);
+  return q;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> IndexerImpl::preprocess_indexer_k(
+    const torch::Tensor& x,
+    const torch::Tensor& positions,
+    torch::Tensor& k_cache,
+    const AttentionMetadata& attn_metadata,
+    bool write_k_cache) {
+  // Forward pass through wk and normalize
+  auto k = wk_->forward(x);
+  auto k_dtype = k.dtype();
+  // follow the implementation of DeepSeek-V3.2,
+  // the k_norm is applied on the float32 tensor.
+  auto k_fp32 = k.to(torch::kFloat32);
+  k = std::get<0>(k_norm_->forward(k_fp32)).to(k_dtype);
+
+  // Apply rotary embedding to positional parts only (like Python)
+  auto k_pe = k.slice(-1, 0, rope_head_dim_).unsqueeze(1);
+  rotary_emb_->forward(k_pe,
+                       positions,
+                       attn_metadata.q_cu_seq_lens,
+                       attn_metadata.max_query_len,
+                       attn_metadata.is_prefill);
+  k = rotate_activation(k, hadamard_matrix_);
+
+  if (write_k_cache) {
+    write_prefill_k_cache(k, k_cache, attn_metadata.slot_mapping);
+  }
+
+  // Forward pass through weights projection
+  auto weights = weights_proj_->forward(x);
+
+  return {k, weights};
+}
+
+torch::Tensor IndexerImpl::preprocess_indexer_q_fused(
+    const torch::Tensor& q_norm,
+    const torch::Tensor& positions) {
+  // fuses the query projection(Matmul), Rotary Position Embedding (RoPE), and
+  // an optional Hadamard transformation(Matmul) into a single high-performance
+  // kernel
+  auto output =
+      torch::empty({q_norm.size(0), n_heads_, head_dim_}, q_norm.options());
+  auto w_q = wq_b_->weight().view({n_heads_, head_dim_, -1});
+  kernel::FusedIndexerQParams q_params;
+  q_params.input_q = q_norm;
+  q_params.output = output;
+  q_params.output_scale = std::nullopt;
+  q_params.w_q = w_q;
+  q_params.w_q_scale = std::nullopt;
+  q_params.hadamard_matrix = hadamard_matrix_;
+  q_params.sin = rotary_emb_->get_sin_cache();
+  q_params.cos = rotary_emb_->get_cos_cache();
+  q_params.position_id = positions;
+  q_params.quant_mode = "none";
+  q_params.interleaved = rotary_emb_->get_interleaved();
+  q_params.rope_at_front = q_rope_at_front_;
+  kernel::fused_indexer_q(q_params);
+  return output;
+}
+
+torch::Tensor IndexerImpl::preprocess_indexer_k_fused(
+    const torch::Tensor& x,
+    const torch::Tensor& positions,
+    torch::Tensor& k_cache,
+    const AttentionMetadata& attn_metadata) {
+  // Perform wk(x), layernorm, rope, wproj(x) and quant to paged k_cache
+  auto wproj_weight = weights_proj_->weight();
+  auto head_weights =
+      torch::empty({x.size(0), wproj_weight.size(0)}, x.options());
+  kernel::FusedIndexerKParams k_params;
+  k_params.x = x;
+  k_params.wk = wk_->weight();
+  k_params.wproj = wproj_weight;
+  k_params.sin_table = rotary_emb_->get_sin_cache();
+  k_params.cos_table = rotary_emb_->get_cos_cache();
+  k_params.position_id = positions;
+  k_params.slot_mapping = attn_metadata.slot_mapping;
+  k_params.head_weights = head_weights;
+  k_params.k_cache = k_cache;
+  k_params.k_cache_scale = std::nullopt;
+  k_params.hadamard_matrix = hadamard_matrix_;
+  k_params.interleaved = rotary_emb_->get_interleaved();
+  k_params.gamma = k_norm_->weight();
+  k_params.beta = k_norm_->bias();
+  k_params.eps = k_norm_->eps();
+  kernel::fused_indexer_k(k_params);
+  return head_weights;
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+IndexerImpl::preprocess_indexer_inputs(const torch::Tensor& x,
+                                       const torch::Tensor& q_norm,
+                                       const torch::Tensor& positions,
+                                       torch::Tensor& k_cache,
+                                       const AttentionMetadata& attn_metadata,
+                                       bool is_prefill,
+                                       bool write_k_cache) {
+  torch::Tensor q, k, weights;
+  if (!is_prefill && enable_fused_qk_) {
+    q = preprocess_indexer_q_fused(q_norm, positions);
+    weights = preprocess_indexer_k_fused(x, positions, k_cache, attn_metadata);
+  } else {
+    q = preprocess_indexer_q(q_norm, positions, attn_metadata);
+    std::tie(k, weights) = preprocess_indexer_k(
+        x, positions, k_cache, attn_metadata, write_k_cache);
+  }
+  return {q, k, weights};
+}
+
+IndexerSPPreOut IndexerImpl::sp_pre(
+    const torch::Tensor& x,
+    const torch::Tensor& q_norm,
+    const torch::Tensor& positions,
+    const AttentionMetadata& attn_metadata,
+    const v32_sp::DeepseekV32SPContext& sp_ctx) {
+  (void)sp_ctx;
+  IndexerSPPreOut out;
+  std::tie(out.q, out.k_local, out.weights) =
+      preprocess_indexer_inputs(x,
+                                q_norm,
+                                positions,
+                                out.k_local,
+                                attn_metadata,
+                                /*is_prefill=*/true,
+                                /*write_k_cache=*/false);
+  return out;
+}
+
+v32_sp::PaddedGatherHandle IndexerImpl::sp_comm(
+    const torch::Tensor& k_local,
+    const v32_sp::DeepseekV32SPContext& sp_ctx) {
+  if (!k_local.defined()) {
+    return {};
+  }
+  torch::Tensor padded_k = v32_sp::pad_to_sp_rows(k_local, sp_ctx);
+  return v32_sp::launch_gather_padded(padded_k, sp_ctx);
+}
+
+torch::Tensor IndexerImpl::sp_wait_k(
+    const torch::Tensor& k_local,
+    const v32_sp::PaddedGatherHandle& gather_handle,
+    const v32_sp::DeepseekV32SPContext& sp_ctx) {
+  if (!gather_handle.gather_ctx.shards.empty()) {
+    return v32_sp::finish_gather_padded(gather_handle, sp_ctx);
+  }
+  return k_local;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> IndexerImpl::sp_post(
+    const IndexerSPPreOut& pre_out,
+    const torch::Tensor& k_global,
+    torch::Tensor& k_cache,
+    const AttentionMetadata& attn_metadata,
+    const v32_sp::DeepseekV32SPMetadata& sp_meta,
+    const v32_sp::DeepseekV32SPContext& sp_ctx) {
+  (void)sp_ctx;
+  CHECK(attn_metadata.is_prefill || attn_metadata.is_chunked_prefill)
+      << "deepseek_v32 sequence parallel indexer only supports prefill "
+         "batches.";
+  CHECK(sp_ctx.batch_forward_type.no_decode())
+      << "deepseek_v32 sequence parallel indexer only supports prefill "
+         "batches.";
+  CHECK(attn_metadata.slot_mapping.defined())
+      << "deepseek_v32 sequence parallel indexer requires slot_mapping.";
+  CHECK_EQ(k_global.size(0), attn_metadata.slot_mapping.numel())
+      << "deepseek_v32 sequence parallel expects gathered K rows to match "
+         "slot_mapping size before packing.";
+  CHECK_EQ(sp_meta.seg_q_cu_lens.size(0), sp_meta.seg_ctx_lens.size(0) + 1)
+      << "deepseek_v32 sequence parallel expects one seg_q_cu_lens prefix "
+         "entry per segment.";
+  CHECK_EQ(sp_meta.seg_suffix_k_cu_lens.size(0),
+           sp_meta.seg_ctx_lens.size(0) + 1)
+      << "deepseek_v32 sequence parallel expects one seg_suffix_k_cu_lens "
+         "prefix entry per segment.";
+  CHECK_EQ(sp_meta.seg_ctx_cu_lens.size(0), sp_meta.seg_ctx_lens.size(0) + 1)
+      << "deepseek_v32 sequence parallel expects one seg_ctx_cu_lens prefix "
+         "entry per segment.";
+
+  // For chunked SP, keep the runtime contract aligned with the normal chunked
+  // indexer path: write the freshly computed suffix K into paged cache first,
+  // rebuild the full-context dense K from cache, then repack it into segment
+  // order before select. Feeding suffix-only K here would truncate the
+  // effective context seen by the indexer on long prompts.
+  write_prefill_k_cache(k_global, k_cache, attn_metadata.slot_mapping);
+  torch::Tensor q = pre_out.q;
+  torch::Tensor weights = pre_out.weights;
+  IndexerRuntimeContext ctx = prepare_runtime_context(k_global,
+                                                      k_cache,
+                                                      q,
+                                                      weights,
+                                                      attn_metadata,
+                                                      /*is_prefill=*/true,
+                                                      q.size(0));
+  if (attn_metadata.is_chunked_prefill) {
+    ctx.k_cache_tensor = v32_sp::pack_sp_ctx_k(ctx.k_cache_tensor, sp_meta);
+  } else {
+    ctx.k_cache_tensor = v32_sp::pack_sp_k_for_indexer(k_global, sp_meta);
+  }
+  return run_indexer_select_kernel(
+      attn_metadata, /*is_prefill=*/true, ctx, &sp_meta);
+}
+
+void IndexerImpl::write_prefill_k_cache(const torch::Tensor& k,
+                                        torch::Tensor& k_cache,
+                                        const torch::Tensor& slot_mapping) {
+  auto k_unsqueezed = k.unsqueeze(1);
+  janus::kernel::ReshapePagedCacheParams reshape_paged_cache_params;
+  reshape_paged_cache_params.key = k_unsqueezed;
+  reshape_paged_cache_params.value = std::nullopt;
+  reshape_paged_cache_params.k_cache = k_cache;
+  reshape_paged_cache_params.v_cache = std::nullopt;
+  reshape_paged_cache_params.slot_mapping = slot_mapping;
+  reshape_paged_cache_params.direction = false;
+  janus::kernel::reshape_paged_cache(reshape_paged_cache_params);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> IndexerImpl::run_indexer_select_kernel(
+    const AttentionMetadata& attn_metadata,
+    bool is_prefill,
+    IndexerRuntimeContext& ctx,
+    const v32_sp::DeepseekV32SPMetadata* sp_meta) {
+  // Call masked indexer select paged kv
+  kernel::MaskedIndexerSelectPagedKVParams params;
+  params.query = ctx.q;
+  params.k_cache = ctx.k_cache_tensor;
+  params.weights = ctx.weights;
+  if (sp_meta != nullptr) {
+    params.kv_cache_block_table = sp_meta->seg_block_table;
+    params.cu_seq_q_lens = sp_meta->seg_q_cu_lens;
+    params.cu_seq_k_lens = attn_metadata.is_chunked_prefill
+                               ? sp_meta->seg_ctx_cu_lens
+                               : sp_meta->seg_suffix_k_cu_lens;
+    params.k_context_lens = sp_meta->seg_ctx_lens;
+  } else {
+    params.kv_cache_block_table = attn_metadata.block_table;
+    params.cu_seq_q_lens = ctx.cu_seq_q_lens;
+    params.cu_seq_k_lens = ctx.cu_seq_k_lens;
+    params.k_context_lens = ctx.k_context_lens;
+  }
+  params.k_cache_block_table = ctx.k_block_table;
+  params.is_prefill = is_prefill;
+  params.softmax_scale = softmax_scale_;
+  params.q_scale = std::nullopt;        // empty tensor as q_scale
+  params.k_scale_cache = std::nullopt;  // empty tensor as k_scale_cache
+  params.index_topk = index_topk_;
+  params.kv_cache_block_size = FLAGS_block_size;
+  params.sparse_block_table = ctx.new_block_tables;
+  params.sparse_context_lens = ctx.new_context_lens;
+
+  janus::kernel::masked_indexer_select_paged_kv(params);
+
+  if (!is_prefill) {
+    ctx.new_block_tables =
+        ctx.new_block_tables.view({-1, ctx.new_block_tables.size(-1)});
+  }
+
+  return {ctx.new_block_tables, ctx.new_context_lens};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> IndexerImpl::forward(
+    const torch::Tensor& x,
+    const torch::Tensor& q_norm,
+    const torch::Tensor& positions,
+    torch::Tensor& k_cache,
+    const AttentionMetadata& attn_metadata,
+    bool is_prefill,
+    const std::optional<torch::Tensor>& mask) {
+  (void)mask;
+  torch::Tensor q, k, weights;
+  std::tie(q, k, weights) = preprocess_indexer_inputs(x,
+                                                      q_norm,
+                                                      positions,
+                                                      k_cache,
+                                                      attn_metadata,
+                                                      is_prefill,
+                                                      /*write_k_cache=*/true);
+  // Unified parameter setup for both prefill and decode modes
+  IndexerRuntimeContext ctx = prepare_runtime_context(
+      k, k_cache, q, weights, attn_metadata, is_prefill, x.size(0));
+
+  return run_indexer_select_kernel(attn_metadata, is_prefill, ctx);
+}
+
+// load the weight from the checkpoint
+void IndexerImpl::load_state_dict(const StateDict& state_dict) {
+  if (state_dict.size() == 0) {
+    return;
+  }
+  // Load weights for each linear layer
+  wq_b_->load_state_dict(state_dict.get_dict_with_prefix("wq_b."));
+  wk_->load_state_dict(state_dict.get_dict_with_prefix("wk."));
+  weights_proj_->load_state_dict(
+      state_dict.get_dict_with_prefix("weights_proj."));
+  k_norm_->load_state_dict(state_dict.get_dict_with_prefix("k_norm."));
+}
+
+}  // namespace layer
+}  // namespace janus

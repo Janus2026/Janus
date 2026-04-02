@@ -1,0 +1,83 @@
+#include "embed_vlm_worker_impl.h"
+
+#include <c10/core/DeviceGuard.h>
+#include <folly/Unit.h>
+#include <folly/futures/Future.h>
+#include <glog/logging.h>
+#include <torch/torch.h>
+
+#include <memory>
+#include <optional>
+#include <utility>
+
+#include "common/metrics.h"
+#include "framework/kv_cache/kv_cache.h"
+#include "framework/model/model_input_params.h"
+#include "framework/state_dict/state_dict.h"
+#include "models/model_registry.h"
+#include "options.h"
+#include "util/timer.h"
+
+namespace janus {
+
+EmbedVLMWorkerImpl::EmbedVLMWorkerImpl(const ParallelArgs& parallel_args,
+                                       const torch::Device& device,
+                                       const runtime::Options& options)
+    : WorkerImpl(parallel_args, device, options) {}
+
+bool EmbedVLMWorkerImpl::init_model(ModelContext& context) {
+  CHECK(model_ == nullptr) << "Model is already initialized.";
+
+  context.set_image_embedding_mode(true);
+  model_ = create_vlm_embedding_model(context);
+  CHECK(model_ != nullptr) << "Failed to create model.";
+  model_executor_ = std::make_unique<Executor>(
+      model_.get(), context.get_model_args(), device_, options_);
+
+  return true;
+}
+
+std::optional<ForwardOutput> EmbedVLMWorkerImpl::step(
+    const ForwardInput& input) {
+  torch::DeviceGuard device_guard(device_);
+  auto ret = device_.synchronize_default_stream();
+
+  Timer timer;
+
+  // TODO to adapt multi stream parallel later, just use [0] temporarily
+  // all tensors should be on the same device as model
+  auto flatten_tokens = input.token_ids.to(device_);
+  auto flatten_positions = input.positions.to(device_);
+  auto params = input.input_params.to(device_);
+  auto sampling_params = input.sampling_params.to(device_, dtype_);
+
+  // call model executor forward to get hidden states
+  auto model_output = model_executor_->forward(
+      flatten_tokens, flatten_positions, kv_caches_, params);
+  auto hidden_states = model_output.hidden_states;
+
+  ret = device_.synchronize_default_stream();
+  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
+
+  if (!driver_) {
+    return std::nullopt;
+  }
+
+  // driver prepare model output
+  ForwardOutput output;
+  SampleOutput sample_output;
+
+  if (sampling_params.selected_token_idxes.defined() &&
+      input.sampling_params.is_embeddings) {
+    EmbeddingVLM* em_model = dynamic_cast<EmbeddingVLM*>(model_.get());
+    auto embeddings =
+        em_model->pooler(hidden_states, sampling_params.selected_token_idxes);
+    sample_output.embeddings = embeddings;
+    output.sample_output = sample_output;
+    output.embedding = embeddings;
+  }
+  ret = device_.synchronize_default_stream();
+  return output;
+}
+
+}  // namespace janus

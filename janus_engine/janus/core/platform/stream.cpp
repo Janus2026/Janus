@@ -1,0 +1,91 @@
+#include "stream.h"
+
+#include <ostream>
+
+namespace janus {
+
+#if defined(USE_NPU)
+Stream::Stream(const int32_t timeout)
+    : stream_(c10_npu::getNPUStreamFromPool()), timeout_(timeout) {}
+#elif defined(USE_MLU)
+Stream::Stream(const int32_t timeout)
+    : stream_(torch_mlu::getStreamFromPool()), timeout_(timeout) {}
+#elif defined(USE_CUDA) || defined(USE_ILU)
+Stream::Stream(const int32_t timeout)
+    : stream_(c10::cuda::getStreamFromPool()), timeout_(timeout) {}
+#elif defined(USE_MUSA)
+Stream::Stream(const int32_t timeout)
+    : stream_(c10::musa::getStreamFromPool()), timeout_(timeout) {}
+#endif
+
+#if defined(USE_NPU)
+Stream::Stream(c10_npu::NPUStream stream, const int32_t timeout)
+    : stream_(stream), timeout_(timeout) {}
+#elif defined(USE_MLU)
+Stream::Stream(torch_mlu::MLUStream stream, const int32_t timeout)
+    : stream_(stream), timeout_(timeout) {}
+#elif defined(USE_CUDA) || defined(USE_ILU)
+Stream::Stream(c10::cuda::CUDAStream stream, const int32_t timeout)
+    : stream_(stream), timeout_(timeout) {}
+#elif defined(USE_MUSA)
+Stream::Stream(c10::musa::MUSAStream stream, const int32_t timeout)
+    : stream_(stream), timeout_(timeout) {}
+#endif
+
+int Stream::synchronize() const {
+#if defined(USE_NPU)
+  return aclrtSynchronizeStreamWithTimeout(stream_.stream(), timeout_);
+#elif defined(USE_MLU)
+  stream_.unwrap().synchronize();
+  return 0;
+#elif defined(USE_CUDA) || defined(USE_ILU) || defined(USE_MUSA)
+  stream_.synchronize();
+  return 0;
+#else
+  LOG(FATAL) << "Not supported backend, currently we support 'npu', 'cuda', "
+                "'mlu', 'musa'.";
+#endif
+}
+
+c10::StreamGuard Stream::set_stream_guard() const {
+#if defined(USE_CUDA) || defined(USE_ILU) || defined(USE_MUSA)
+  return c10::StreamGuard(stream_);
+#else
+  return c10::StreamGuard(stream_.unwrap());
+#endif
+}
+
+void Stream::wait_stream(const Stream& other_stream) {
+  // get the c10::Stream objects for the current stream and the other stream
+#if defined(USE_CUDA) || defined(USE_ILU)
+  const c10::Stream& current_c10_stream = this->stream_;
+  const c10::Stream& target_c10_stream = other_stream.stream_;
+#else
+  c10::Stream current_c10_stream = this->stream_.unwrap();
+  c10::Stream target_c10_stream = other_stream.stream_.unwrap();
+#endif
+
+  c10::Event event(current_c10_stream.device_type());
+  event.record(target_c10_stream);
+  event.block(current_c10_stream);
+}
+
+std::ostream& operator<<(std::ostream& os, const Stream& stream) {
+#if defined(USE_NPU)
+  // NPUStream output: device index and stream id
+  os << "NPUStream[device=" << stream.stream_.device_index()
+     << ", stream_id=" << stream.stream_.id() << "]";
+#elif defined(USE_MLU)
+  // MLUStream output: device index and stream id
+  os << "MLUStream[device=" << stream.stream_.device_index()
+     << ", stream_id=" << stream.stream_.id() << "]";
+#elif defined(USE_CUDA) || defined(USE_ILU)
+  // For CUDA, use the existing operator<< from c10::cuda::CUDAStream
+  os << stream.stream_;
+#else
+  os << "UnknownStream";
+#endif
+  return os;
+}
+
+}  // namespace janus

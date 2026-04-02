@@ -1,0 +1,89 @@
+include(cc_library)
+include(cc_test)
+
+cc_library(
+  NAME 
+    request
+  HDRS
+    dit_request.h
+    dit_request_params.h
+    finish_reason.h
+    incremental_decoder.h
+    mm_batch_data.h
+    mm_codec.h
+    mm_data.h
+    mm_data_item.h
+    mm_item_state.h
+    mm_data_visitor.h
+    mm_handler.h
+    mm_embedding_handler.h
+    mm_input.h
+    mm_type.h
+    request_base.h
+    request.h
+    dit_request.h
+    request_output.h
+    dit_request_output.h
+    dit_request_params.h
+    request_params.h
+    sample_slot.h
+    sequence.h
+    sequence_logprob_state.h
+    sequence_kv_state.h
+    sequences_group.h
+    request_state.h
+    rec_type.h
+    stopping_checker.h
+    priority_comparator.h
+  SRCS
+    dit_request.cpp
+    finish_reason.cpp
+    incremental_decoder.cpp
+    mm_batch_data.cpp
+    mm_codec.cpp
+    mm_data.cpp
+    mm_data_item.cpp
+    mm_item_state.cpp
+    mm_data_visitor.cpp
+    mm_handler.cpp
+    mm_embedding_handler.cpp
+    mm_input.cpp
+    mm_type.cpp
+    request.cpp
+    dit_request.cpp
+    request_output.cpp
+    dit_request_output.cpp
+    request_params.cpp
+    sample_slot.cpp
+    dit_request_params.cpp
+    sequence.cpp
+    sequence_logprob_state.cpp
+    sequence_kv_state.cpp
+    sequences_group.cpp
+    request_state.cpp
+    stopping_checker.cpp
+    priority_comparator.cpp
+  DEPS
+    :kv_cache
+    :prefix_cache
+    :block
+    :tokenizer
+    :chat_template
+    glog::glog
+    absl::strings
+    absl::time
+    proto::janus_proto
+    torch
+    ${OpenCV_LIBS}
+)
+
+cc_test(
+  NAME
+    sample_slot_test
+  SRCS
+    sample_slot_test.cpp
+  DEPS
+    :request
+    GTest::gtest
+    GTest::gtest_main
+)

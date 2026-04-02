@@ -1,0 +1,429 @@
+name: Build and Test
+
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.event.number || github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  SEGFAULT_SIGNALS: all
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-20.04, ubuntu-22.04, macos-11, macos-12]
+        etcd: [v3.2.32, v3.3.27, v3.4.27, v3.5.9]
+        exclude:
+          - os: ubuntu-20.04
+            etcd: v3.2.26
+          - os: ubuntu-20.04
+            etcd: v3.4.13
+          - os: ubuntu-20.04
+            etcd: v3.5.7
+
+          - os: ubuntu-22.04
+            etcd: v3.2.26
+          - os: ubuntu-22.04
+            etcd: v3.3.11
+          - os: ubuntu-22.04
+            etcd: v3.5.7
+
+          - os: macos-11
+            etcd: v3.2.26
+          - os: macos-11
+            etcd: v3.3.11
+          - os: macos-11
+            etcd: v3.4.13
+
+          - os: macos-12
+            etcd: v3.2.26
+          - os: macos-12
+            etcd: v3.3.11
+          - os: macos-12
+            etcd: v3.4.13
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: true
+
+      - name: Get time
+        run: |
+          date +'%Y-%m' > snapshot.txt
+
+      - name: Cache for cccahe
+        uses: actions/cache@v3
+        with:
+          path: /home/runner/.ccache
+          key: ${{ runner.os }}-ccache-${{ hashFiles('**/snapshot.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
+
+      - name: Install dependencies for Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update -y
+          sudo apt install -y ca-certificates \
+                              ccache \
+                              libboost-all-dev \
+                              libcurl4-openssl-dev \
+                              libssl-dev \
+                              libz-dev \
+                              lsb-release \
+                              openssl \
+                              screenfetch \
+                              wget
+
+          # install cmake
+          wget https://github.com/Kitware/CMake/releases/download/v3.19.3/cmake-3.19.3-Linux-x86_64.sh
+          sudo bash cmake-3.19.3-Linux-x86_64.sh --prefix /usr --skip-license
+
+          # install clang-format
+          sudo curl -L https://github.com/muttleyxd/clang-tools-static-binaries/releases/download/master-1d7ec53d/clang-format-11_linux-amd64 --output /usr/bin/clang-format
+          sudo chmod +x /usr/bin/clang-format
+
+      - name: Install grpc v1.27.x for Ubuntu 18.04
+        if: matrix.os == 'ubuntu-18.04'
+        run: |
+          # from grpc/grpc#18948 and grpc/grpc#21989, on Ubuntu-18.04 the apt-get installed grpc doesn't
+          # work for any program that uses grpc.
+          #
+          git clone https://github.com/grpc/grpc.git --depth 1 --branch v1.27.x
+          cd grpc/
+          git submodule update --init
+          mkdir cmake-build
+          cd cmake-build/
+          cmake .. -DBUILD_SHARED_LIBS=ON \
+            -DgRPC_INSTALL=ON \
+            -DgRPC_BUILD_TESTS=OFF \
+            -DgRPC_BUILD_CSHARP_EXT=OFF \
+            -DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF \
+            -DgRPC_BUILD_GRPC_NODE_PLUGIN=OFF \
+            -DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=OFF \
+            -DgRPC_BUILD_GRPC_PHP_PLUGIN=OFF \
+            -DgRPC_BUILD_GRPC_PYTHON_PLUGIN=OFF \
+            -DgRPC_BUILD_GRPC_RUBY_PLUGIN=OFF \
+            -DgRPC_BACKWARDS_COMPATIBILITY_MODE=ON \
+            -DgRPC_ZLIB_PROVIDER=package \
+            -DgRPC_SSL_PROVIDER=package
+          make -j`nproc`
+          sudo make install
+
+      - name: Install grpc for Ubuntu 20.04 or later
+        if: ${{ runner.os != 'macOS' && matrix.os != 'ubuntu-18.04' }}
+        run: |
+          sudo apt install -y libcurl4-openssl-dev \
+                              libprotobuf-dev \
+                              libprotoc-dev \
+                              libgrpc-dev \
+                              libgrpc++-dev \
+                              protobuf-compiler-grpc
+
+          # install libsegfault.so
+          sudo apt-get install libc6 || true
+          sudo apt-get install glibc-tools || true
+
+      - name: Install dependencies for Mac
+        if: runner.os == 'macOS'
+        run: |
+          brew install ccache cmake boost curl grpc protobuf openssl zlib unzip wget screenfetch
+
+      - name: Screen fetch
+        run: |
+          screenfetch
+
+      - name: Install etcd for Linux
+        if: runner.os == 'Linux'
+        run: |
+          # install etcd
+          wget https://github.com/etcd-io/etcd/releases/download/${{ matrix.etcd }}/etcd-${{ matrix.etcd }}-linux-amd64.tar.gz
+          tar zxvf etcd-${{ matrix.etcd }}-linux-amd64.tar.gz
+          sudo mv etcd-${{ matrix.etcd }}-linux-amd64/etcd /usr/local/bin/
+          sudo mv etcd-${{ matrix.etcd }}-linux-amd64/etcdctl /usr/local/bin/
+
+      - name: Install etcd for Mac
+        if: runner.os == 'macOS'
+        run: |
+          # install etcd
+          wget https://github.com/etcd-io/etcd/releases/download/${{ matrix.etcd }}/etcd-${{ matrix.etcd }}-darwin-amd64.zip
+          unzip etcd-${{ matrix.etcd }}-darwin-amd64.zip
+          sudo mv etcd-${{ matrix.etcd }}-darwin-amd64/etcd /usr/local/bin/
+          sudo mv etcd-${{ matrix.etcd }}-darwin-amd64/etcdctl /usr/local/bin/
+
+      - name: Install cpprestsdk
+        run: |
+          mkdir -p build
+          cd build
+          git clone https://github.com/microsoft/cpprestsdk.git
+          mkdir -p cpprestsdk/build
+          cd cpprestsdk/build
+          cmake .. -DCMAKE_BUILD_TYPE=Debug \
+                   -DBUILD_TESTS=OFF \
+                   -DBUILD_SAMPLES=OFF \
+                   -DCPPREST_EXCLUDE_WEBSOCKETS=ON \
+                   -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          make -j`nproc`
+          sudo make install
+
+      - name: Setup tmate session
+        if: false
+        uses: mxschmitt/action-tmate@v3
+
+      - name: CMake
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu
+
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_CXX_STANDARD=17 \
+                   -DCMAKE_CXX_STANDARD_REQUIRED=TRUE \
+                   -DCMAKE_BUILD_TYPE=Debug \
+                   -DBUILD_ETCD_TESTS=ON \
+                   -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Format
+        if: runner.os == 'Linux'
+        run: |
+          cd build
+
+          function prepend() { while read line; do echo "${1}${line}"; done; }
+
+          make etcd_cpp_apiv3_clformat
+          GIT_DIFF=$(git diff --ignore-submodules)
+          if [[ -n $GIT_DIFF ]]; then
+              echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+              echo "| clang-format failures found!"
+              echo "|"
+              echo "$GIT_DIFF" | prepend "| "
+              echo "|"
+              echo "| Run: "
+              echo "|"
+              echo "|    make etcd_cpp_apiv3_clformat"
+              echo "|"
+              echo "| to fix this error."
+              echo "|"
+              echo "| Ensure you are working with clang-format-11, which can be obtained from"
+              echo "|"
+              echo "|    https://github.com/muttleyxd/clang-tools-static-binaries/releases "
+              echo "|"
+              echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+              exit -1
+          fi
+
+
+      - name: Build
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu
+
+          cd build
+          make -j`nproc`
+          sudo make install
+
+      - name: Setup tmate session
+        if: false
+        uses: mxschmitt/action-tmate@v3
+
+      - name: Test
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu
+
+          # use etcd v3 api
+          export ETCDCTL_API="3"
+
+          rm -rf default.etcd
+          /usr/local/bin/etcd &
+
+          sleep 5
+
+          # tests without auth
+
+          echo "Run the etcd resolver test ........................."
+          # there's no ipv6 on github CI runner
+          # ./build/bin/EtcdResolverTest
+
+          echo "Run the etcd sync test ........................."
+          ./build/bin/EtcdSyncTest
+
+          echo "Run the etcd test ........................."
+          ./build/bin/EtcdTest
+
+          echo "Run the etcd campaign test ........................."
+          ./build/bin/CampaignTest
+
+          echo "Run the etcd memory leak test ........................."
+          ./build/bin/MemLeakTest
+
+          echo "Run the etcd watcher test ........................."
+          ./build/bin/WatcherTest
+
+          echo "Run the etcd memory leak in watcher test ........................."
+          ./build/bin/MemLeakWatcherTest
+
+          echo "Run the etcd keepalive test ........................."
+          ./build/bin/KeepAliveTest
+
+          echo "Run the etcd transaction test ........................."
+          ./build/bin/TransactionTest
+
+          echo "Run the etcd election test ........................."
+          ./build/bin/ElectionTest
+
+          echo "Run the etcd with fork test ........................."
+          ./build/bin/ForkTest
+
+          killall -TERM etcd || true
+          sleep 5
+
+      - name: Lock Test
+        if: false
+        run: |
+          killall -TERM etcd || true
+          sleep 5
+
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu
+
+          # use etcd v3 api
+          export ETCDCTL_API="3"
+
+          rm -rf default.etcd
+          /usr/local/bin/etcd &
+
+          sleep 5
+
+          echo "Run the etcd lock test ........................."
+          ./build/bin/LockTest
+
+          killall -TERM etcd || true
+          sleep 5
+
+      - name: Lock Tests with Debug
+        if: true
+        uses: sighingnow/action-tmate@master
+        with:
+          script-to-run: |
+            killall -TERM etcd || true
+            sleep 5
+
+            # enable coredump for debugging
+            ulimit -c unlimited
+
+            export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu
+
+            # use etcd v3 api
+            export ETCDCTL_API="3"
+
+            rm -rf default.etcd
+            /usr/local/bin/etcd &
+
+            sleep 5
+
+            echo "Run the etcd lock test ........................."
+            ./build/bin/LockTest
+
+            killall -TERM etcd || true
+            sleep 5
+
+      - name: Authentication Test
+        run: |
+          killall -TERM etcd || true
+          sleep 5
+
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu
+
+          # use etcd v3 api
+          export ETCDCTL_API="3"
+
+          rm -rf default.etcd
+          /usr/local/bin/etcd &
+
+          sleep 5
+
+          # for etcd v3.2, v3.3
+          if [[ "${{ matrix.etcd }}" == v3.2* ]] || [[ "${{ matrix.etcd }}" == v3.3* ]];
+          then
+              printf 'root\nroot\n' | /usr/local/bin/etcdctl user add root || true
+          fi
+          # for etcd v3.4
+          if [[ "${{ matrix.etcd }}" == v3.4* ]] || [[ "${{ matrix.etcd }}" == v3.5* ]];
+          then
+              /usr/local/bin/etcdctl user add root --new-user-password="root" || true
+          fi
+
+          /usr/local/bin/etcdctl auth enable || true
+
+          ./build/bin/AuthTest
+
+          # for etcd v3.2
+          if [[ "${{ matrix.etcd }}" == v3.2* ]] || [[ "${{ matrix.etcd }}" == v3.3* ]];
+          then
+              /usr/local/bin/etcdctl --user="root:root" auth disable || true
+          fi
+          # for etcd v3.4
+          if [[ "${{ matrix.etcd }}" == v3.4* ]] || [[ "${{ matrix.etcd }}" == v3.5* ]];
+          then
+              /usr/local/bin/etcdctl auth disable --user="root" --password="root" || true
+          fi
+
+          killall -TERM etcd || true
+          sleep 5
+
+      - name: Transport Security and Authentication Test
+        run: |
+          killall -TERM etcd || true
+          sleep 5
+
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu
+
+          # use etcd v3 api
+          export ETCDCTL_API="3"
+
+          # generate CA certificates
+          ./security-config/reset-ca.sh
+          ./security-config/setup-ca.sh
+
+          rm -rf default.etcd
+          /usr/local/bin/etcd \
+            --cert-file security-config/certs/etcd0.example.com.crt \
+            --key-file security-config/private/etcd0.example.com.key \
+            --client-cert-auth \
+            --trusted-ca-file security-config/certs/ca.crt \
+            --advertise-client-urls=https://127.0.0.1:2379 \
+            --listen-client-urls=https://127.0.0.1:2379 &
+
+          sleep 5
+
+          ./build/bin/SecurityChannelTest
+
+          killall -TERM etcd
+          sleep 5
+
+      - name: Etcd Member test
+        run: |
+          killall -TERM etcd || true
+          sleep 5
+
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu
+
+          # use etcd v3 api
+          export ETCDCTL_API="3"
+          
+
+          rm -rf default.etcd
+          /usr/local/bin/etcd &
+          sleep 5
+
+          ./build/bin/EtcdMemberTest
+
+          killall -TERM etcd
+          sleep 5
+        
+      - name: Check ccache
+        run: |
+          ccache --show-stats
+

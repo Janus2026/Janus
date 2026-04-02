@@ -1,0 +1,64 @@
+#pragma once
+#include <torch/torch.h>
+
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+#include "common/global_flags.h"
+#include "framework/model/model_input_params.h"
+
+namespace janus {
+class KVCache final {
+ public:
+  KVCache() = default;
+  KVCache(torch::Tensor key_cache, torch::Tensor value_cache);
+  KVCache(torch::Tensor key_cache,
+          torch::Tensor value_cache,
+          torch::Tensor index_cache);
+  // Constructor for quantized KV cache with scale tensors
+  KVCache(torch::Tensor key_cache,
+          torch::Tensor value_cache,
+          torch::Tensor index_cache,
+          torch::Tensor key_cache_scale,
+          torch::Tensor value_cache_scale);
+  KVCache(torch::Tensor key_cache,
+          torch::Tensor value_cache,
+          torch::Tensor conv_cache,
+          torch::Tensor ssm_cache);
+  ~KVCache() = default;
+
+  // TODO: pass in kv_shape and options instead
+  torch::Tensor get_k_cache() const;
+  torch::Tensor get_v_cache() const;
+  torch::Tensor get_index_cache() const;
+
+  // Get scale tensors for quantized KV cache
+  std::optional<torch::Tensor> get_k_cache_scale() const;
+  std::optional<torch::Tensor> get_v_cache_scale() const;
+
+  torch::Tensor get_conv_cache() const;
+  torch::Tensor get_ssm_cache() const;
+  std::vector<std::vector<int64_t>> get_shapes();
+
+  bool empty() const {
+    return !key_cache_.defined() || !value_cache_.defined();
+  }
+
+  void swap_blocks(torch::Tensor& src_tensor, torch::Tensor& dst_tensor);
+
+ private:
+  torch::Tensor key_cache_;
+  torch::Tensor value_cache_;
+  torch::Tensor index_cache_;
+
+  // scale tensors for quantized KV cache (int8)
+  torch::Tensor key_cache_scale_;
+  torch::Tensor value_cache_scale_;
+  // Convolutional state cache for linear-attention layers (conv_state).
+  torch::Tensor conv_cache_;
+  // State space model cache for linear-attention layers (ssm_state).
+  torch::Tensor ssm_cache_;
+};
+
+}  // namespace janus

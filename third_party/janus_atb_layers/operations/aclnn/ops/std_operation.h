@@ -1,0 +1,73 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef ATB_SPEED_PLUGIN_ACLNN_STD_OPERATION_H
+#define ATB_SPEED_PLUGIN_ACLNN_STD_OPERATION_H
+
+#include "operations/aclnn/core/acl_nn_operation.h"
+#include "atb_speed/utils/operation_util.h"
+
+namespace atb_speed {
+namespace common {
+
+/// This class defines an operator that calculates the standard deviation of the input.
+///
+/// This class makes uses of `aclnnStdGetWorkspaceSize` and `aclnnStd` from AscendCL Api.
+///
+/// Inputs to the operator:
+/// Name         | Dtype               | Shape |
+/// -------------|---------------------|-------|
+/// input        | float16 or bfloat16 | [m,n] |
+///
+/// Outputs of the operator:
+/// Name         | Dtype               | Shape |
+/// -------------|---------------------|-------|
+/// output       | float16 or bfloat16 | [m,n] |
+///
+/// Example:
+/// \code
+/// enum TensorIdx : uint32_t {
+///     INPUT = 0,
+///     OUT,
+/// };
+/// atb::Node &stdNode = opGraph.nodes.at(nodeId++);
+/// stdNode.operation = new atb_speed::common::StdOperation("SparseMoeStdNode");
+/// stdNode.inTensorIds = {INPUT};
+/// stdNode.outTensorIds = {OUTPUT};
+/// \endcode
+
+class StdOperation : public AclNNOperation {
+public:
+    explicit StdOperation(const std::string &name);
+    ~StdOperation() override;
+    atb::Status InferShape(const atb::SVector<atb::TensorDesc> &inTensorDescs,
+                           atb::SVector<atb::TensorDesc> &outTensorDescs) const override;
+    uint32_t GetInputNum() const override;
+    uint32_t GetOutputNum() const override;
+
+private:
+    int SetAclNNWorkspaceExecutor() override;
+    int ExecuteAclNNOp(uint8_t *workspace, aclrtStream &stream) override;
+
+    atb::Status CreateAclNNInTensorVariantPack(const atb::VariantPack &variantPack) override;
+    atb::Status CreateAclNNOutTensorVariantPack(const atb::VariantPack &variantPack) override;
+
+    std::vector<int64_t> dimData = {1};
+    aclIntArray *dim = nullptr;
+};
+} // namespace common
+} // namespace atb_speed
+#endif

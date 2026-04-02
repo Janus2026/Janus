@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package janus_service.proto;
+option cc_enable_arenas = true;
+option cc_generic_services = true;
+
+message HttpHelloRequest {
+  string ping = 1;
+}
+
+message HttpHelloResponse {
+  string pong = 1;
+}
+
+message ModelTriggerRequest {
+  string instance_name = 1;
+  string model_id = 2;
+  string trigger_type = 3;
+}
+
+message HttpRequest {
+}
+
+message HttpResponse {
+}
+
+service JanusHttpService {
+  rpc Hello (HttpHelloRequest) returns (HttpHelloResponse) {}
+  rpc Completions (HttpRequest) returns (HttpResponse) {}
+  rpc ChatCompletions (HttpRequest) returns (HttpResponse) {}
+  rpc Embeddings (HttpRequest) returns (HttpResponse) {}
+  rpc Models (HttpRequest) returns (HttpResponse) {}
+  rpc Metrics (HttpRequest) returns (HttpResponse) {}
+  rpc ModelTriggers (ModelTriggerRequest) returns (HttpResponse) {}
+}

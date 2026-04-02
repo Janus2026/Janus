@@ -1,0 +1,74 @@
+#include <c10/core/Device.h>
+#include <glog/logging.h>
+#include <torch/torch.h>
+#include <torch_npu/csrc/libs/init_npu.h>
+#include <torch_npu/torch_npu.h>
+
+#include <nlohmann/json.hpp>
+#ifdef TORCH_HIGHER_THAN_PTA6
+#include <torch_npu/csrc/framework/OpCommand.h>
+#else
+#include <torch_npu/csrc/aten/NPUNativeFunctions.h>
+#include <torch_npu/csrc/framework/utils/OpPreparation.h>
+#endif
+
+#include "acl/acl.h"
+#include "aclnnop/aclnn_apply_top_k_top_p.h"
+#include "core/common/macros.h"
+#include "core/kernels/npu/utils.h"
+#include "janus_ops_api.h"
+
+namespace janus::kernel::npu {
+
+// Used by the sampling logits preprocessing path on NPU.
+// This wrapper applies top-k and top-p filtering before token sampling so the
+// downstream sampler only sees the kept candidates.
+// Inputs:
+//   topK: top-k threshold tensor for this sampling step.
+//   topP: top-p threshold tensor for this sampling step.
+// Outputs:
+//   logits: logits tensor filtered in place and consumed by the sampler.
+void top_k_top_p(torch::Tensor& logits,
+                 const torch::Tensor& topK,
+                 const torch::Tensor& topP) {
+  check_tensor(logits, "logits", "top_k_top_p");
+  check_tensor(topK, "topK", "top_k_top_p");
+  check_tensor(topP, "topP", "top_k_top_p");
+  aclTensor* logits_ids = nullptr;
+  aclTensor* topK_ids = nullptr;
+  aclTensor* topP_ids = nullptr;
+  int32_t device_id = logits.device().index();
+  aclrtStream stream = c10_npu::getCurrentNPUStream(device_id).stream();
+  create_acltensor(&logits_ids, logits);
+  create_acltensor(&topK_ids, topK);
+  create_acltensor(&topP_ids, topP);
+
+  uint64_t workspace_size = 0;
+  aclOpExecutor* executor = nullptr;
+  CHECK_ACL_SUCCESS(aclnnApplyTopKTopPGetWorkspaceSize(logits_ids,
+                                                       topP_ids,
+                                                       topK_ids,
+                                                       logits_ids,
+                                                       &workspace_size,
+                                                       &executor),
+                    "top_k_top_p: failed to get workspace size");
+  void* workspace_addr = nullptr;
+  if (workspace_size > 0) {
+    CHECK_ACL_SUCCESS(
+        aclrtMalloc(&workspace_addr, workspace_size, ACL_MEM_MALLOC_HUGE_FIRST),
+        "top_k_top_p: failed to allocate workspace");
+  }
+  CHECK_ACL_SUCCESS(
+      aclnnApplyTopKTopP(workspace_addr, workspace_size, executor, stream),
+      "top_k_top_p: failed to apply top k top p");
+  CHECK_ACL_SUCCESS(aclrtSynchronizeStream(stream),
+                    "top_k_top_p: failed to synchronize stream");
+  aclDestroyTensor(logits_ids);
+  aclDestroyTensor(topK_ids);
+  aclDestroyTensor(topP_ids);
+  if (workspace_size > 0) {
+    CHECK_ACL_SUCCESS(aclrtFree(workspace_addr),
+                      "top_k_top_p: failed to free workspace");
+  }
+}
+}  // namespace janus::kernel::npu

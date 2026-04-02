@@ -1,0 +1,75 @@
+#include "options.h"
+
+namespace janus {
+std::string Options::to_string() const {
+  std::stringstream ss;
+  ss << "Options: [";
+  ss << "model_path: " << model_path()
+     << ", devices: " << devices().value_or("null")
+     << ", draft_model_path: " << draft_model_path().value_or("null")
+     << ", draft_devices: " << draft_devices().value_or("null")
+     << ", backend: " << backend()
+     << ", limit_image_per_prompt: " << limit_image_per_prompt()
+     << ", block_size: " << block_size()
+     << ", max_cache_size: " << max_cache_size()
+     << ", max_memory_utilization: " << max_memory_utilization()
+     << ", enable_prefix_cache: " << enable_prefix_cache()
+     << ", max_tokens_per_batch: " << max_tokens_per_batch()
+     << ", max_seqs_per_batch: " << max_seqs_per_batch()
+     << ", max_tokens_per_chunk_for_prefill: "
+     << max_tokens_per_chunk_for_prefill()
+     << ", num_speculative_tokens: " << num_speculative_tokens()
+     << ", speculative_algorithm: " << speculative_algorithm()
+     << ", speculative_suffix_cache_max_depth: "
+     << speculative_suffix_cache_max_depth()
+     << ", speculative_suffix_max_spec_factor: "
+     << speculative_suffix_max_spec_factor()
+     << ", speculative_suffix_max_spec_offset: "
+     << speculative_suffix_max_spec_offset()
+     << ", speculative_suffix_min_token_prob: "
+     << speculative_suffix_min_token_prob()
+     << ", speculative_suffix_max_cached_requests: "
+     << speculative_suffix_max_cached_requests()
+     << ", speculative_suffix_use_tree_spec: "
+     << speculative_suffix_use_tree_spec()
+     << ", num_request_handling_threads: " << num_request_handling_threads()
+     << ", communication_backend: " << communication_backend().value_or("null")
+     << ", rank_tablefile: " << rank_tablefile().value_or("null")
+     << ", expert_parallel_degree: " << expert_parallel_degree().value_or(0)
+     << ", task_type: " << task_type() << ", enable_mla: " << enable_mla()
+     << ", enable_chunked_prefill: " << enable_chunked_prefill()
+     << ", enable_prefill_sp: " << enable_prefill_sp()
+     << ", master_node_addr: " << master_node_addr().value_or("null")
+     << ", instance_role: " << instance_role().to_string()
+     << ", device_ip: " << device_ip().value_or("null") << ", disagg_pd_port: "
+     << (disagg_pd_port().has_value() ? std::to_string(disagg_pd_port().value())
+                                      : "null")
+     << ", transfer_listen_port: " << transfer_listen_port()
+     << ", nnodes: " << nnodes() << ", node_rank: " << node_rank()
+     << ", enable_schedule_overlap: " << enable_schedule_overlap()
+     << ", enable_disagg_pd: " << enable_disagg_pd()
+     << ", enable_pd_ooc: " << enable_pd_ooc()
+
+     << ", kv_cache_dtype: " << kv_cache_dtype()
+     << ", kv_cache_transfer_mode: " << kv_cache_transfer_mode()
+     << ", etcd_addr: " << etcd_addr().value_or("null")
+     << ", enable_service_routing: " << enable_service_routing()
+     << ", enable_cache_upload: " << enable_cache_upload()
+     << ", enable_kvcache_store: " << enable_kvcache_store()
+     << ", prefetch_timeout: " << prefetch_timeout()
+     << ", prefetch_bacth_size: " << prefetch_bacth_size()
+     << ", layers_wise_copy_batchs: " << layers_wise_copy_batchs()
+     << ", store_protocol: " << store_protocol()
+     << ", store_master_server_address: " << store_master_server_address()
+     << ", store_metadata_server: " << store_metadata_server()
+     << ", store_local_hostname: " << store_local_hostname()
+     << ", enable_multi_stream_parallel: " << enable_multi_stream_parallel()
+     << ", disable_ttft_profiling: " << disable_ttft_profiling()
+     << ", enable_forward_interruption: " << enable_forward_interruption()
+     << ", enable_graph: " << enable_graph()
+     << ", server_idx: " << server_idx();
+  ss << "]";
+  return ss.str();
+}
+
+}  // namespace janus

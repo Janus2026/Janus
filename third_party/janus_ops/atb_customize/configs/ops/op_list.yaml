@@ -1,0 +1,8 @@
+CustomizeBlockCopyOperation:
+    CustomizeBlockCopyKernel:
+        ascend310p: true
+        ascend910b: true
+CustomPagedAttentionOperation:
+    CustomPagedAttentionMaskNdKernel:
+        ascend310p: false
+        ascend910b: true

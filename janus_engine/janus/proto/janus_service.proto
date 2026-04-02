@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package janus.proto;
+option cc_enable_arenas = true;
+option cc_generic_services = true;
+
+import "completion.proto";
+import "sample.proto";
+import "chat.proto";
+import "embedding.proto";
+import "image_generation.proto";
+import "rerank.proto";
+import "models.proto";
+import "anthropic.proto";
+import "common.proto";
+
+message HttpRequest {
+};
+
+message HttpResponse {
+};
+
+message MasterInfos {
+  string model_id = 1;
+  string model_path = 2;
+  string master_node_addr = 3;
+  MasterStatus master_status = 4;
+  repeated string remote_addrs = 5;
+  int32 nnodes = 6;
+  int32 dp_size = 7;
+  // Per-remote-addr weight segments (index matches remote_addrs)
+  repeated MasterWeightSegmentList src_weight_segments = 8;
+  // Optional disagg pd rpc port for forked master instances.
+  int32 disagg_pd_port = 9;
+}
+
+// A single weight segment for master wakeup
+message MasterWeightSegment {
+  uint64 offset = 1;
+  uint64 size = 2;
+}
+
+// List of weight segments for one remote source
+message MasterWeightSegmentList {
+  repeated MasterWeightSegment segments = 1;
+}
+
+message D2DLinkRequest {
+  string model_id = 1;
+  repeated string device_ips = 2;
+}
+
+message ResizeRequest {
+  string model_id = 1;
+  uint64 new_kv_cache_pages = 2;  // Target total KV cache virtual pages
+}
+
+service JanusAPIService {
+  rpc Completions (CompletionRequest) returns (CompletionResponse);
+  rpc CompletionsHttp (HttpRequest) returns (HttpResponse);
+
+  rpc Sample (SampleRequest) returns (SampleResponse);
+  rpc SampleHttp (HttpRequest) returns (HttpResponse);
+
+  rpc ChatCompletions (ChatRequest) returns (ChatResponse);
+  rpc ChatCompletionsHttp (HttpRequest) returns (HttpResponse);
+
+  rpc Embeddings (EmbeddingRequest) returns (EmbeddingResponse);
+  rpc EmbeddingsHttp (HttpRequest) returns (HttpResponse);
+
+  rpc ImageGeneration(ImageGenerationRequest) returns (ImageGenerationResponse);
+  rpc ImageGenerationHttp(HttpRequest) returns (HttpResponse);
+
+  rpc Rerank (RerankRequest) returns (RerankResponse);
+  rpc RerankHttp (HttpRequest) returns (HttpResponse);
+  
+  rpc Models (ModelListRequest) returns (ModelListResponse);
+  rpc ModelsHttp (HttpRequest) returns (HttpResponse);
+
+  rpc ModelVersionsHttp (HttpRequest) returns (HttpResponse);
+
+  rpc AnthropicMessagesHttp (HttpRequest) returns (HttpResponse);
+
+  rpc GetFreePortHttp (HttpRequest) returns (HttpResponse);
+
+  rpc ForkMaster (MasterInfos) returns (Status);
+  rpc ForkMasterHttp (HttpRequest) returns (HttpResponse);
+  
+  rpc Sleep (MasterInfos) returns (Status);
+  rpc SleepHttp (HttpRequest) returns (HttpResponse);
+
+  rpc Wakeup (MasterInfos) returns (Status);
+  rpc WakeupHttp (HttpRequest) returns (HttpResponse);
+
+  rpc LinkD2D (D2DLinkRequest) returns (Status);
+  rpc LinkD2DHttp (HttpRequest) returns (HttpResponse);
+
+  rpc UnlinkD2D (D2DLinkRequest) returns (Status);
+  rpc UnlinkD2DHttp (HttpRequest) returns (HttpResponse);
+
+  rpc Resize (ResizeRequest) returns (Status);
+  rpc ResizeHttp (HttpRequest) returns (HttpResponse);
+};

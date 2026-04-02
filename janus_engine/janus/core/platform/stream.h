@@ -1,0 +1,73 @@
+#pragma once
+
+// clang-format off
+#if defined(USE_NPU)
+#include "graph/types.h"
+#endif
+// clang-format on
+
+#include <c10/core/Event.h>
+#include <c10/core/Stream.h>
+#include <c10/core/StreamGuard.h>
+
+#include <cstdint>
+#include <ostream>
+#if defined(USE_NPU)
+#include <torch_npu/csrc/framework/OpCommand.h>
+#include <torch_npu/torch_npu.h>
+#elif defined(USE_MLU)
+#include <framework/core/MLUStream.h>
+#elif defined(USE_CUDA) || defined(USE_ILU)
+#include <c10/cuda/CUDAStream.h>
+#elif defined(USE_MUSA)
+#include <c10/musa/MUSAGuard.h>
+#endif
+
+namespace janus {
+
+class Stream {
+ public:
+  explicit Stream(const int32_t timeout = -1);
+  ~Stream() = default;
+
+  Stream(const Stream&) = delete;
+  Stream& operator=(const Stream&) = delete;
+  Stream(Stream&&) = default;
+  Stream& operator=(Stream&&) = default;
+
+#if defined(USE_NPU)
+  Stream(c10_npu::NPUStream stream, const int32_t timeout = -1);
+#elif defined(USE_MLU)
+  Stream(torch_mlu::MLUStream stream, const int32_t timeout = -1);
+#elif defined(USE_CUDA) || defined(USE_ILU)
+  Stream(c10::cuda::CUDAStream stream, const int32_t timeout = -1);
+#elif defined(USE_MUSA)
+  Stream(c10::musa::MUSAStream stream, const int32_t timeout = -1);
+#endif
+
+  int synchronize() const;
+  c10::StreamGuard set_stream_guard() const;
+#if defined(USE_NPU)
+  c10_npu::NPUStream* get_stream() { return &stream_; }
+#elif defined(USE_MLU)
+  torch_mlu::MLUStream* get_stream() { return &stream_; }
+#endif
+  void wait_stream(const Stream& other_stream);
+
+  // Support for LOG(INFO) output
+  friend std::ostream& operator<<(std::ostream& os, const Stream& stream);
+
+ private:
+#if defined(USE_NPU)
+  c10_npu::NPUStream stream_;
+#elif defined(USE_MLU)
+  torch_mlu::MLUStream stream_;
+#elif defined(USE_CUDA) || defined(USE_ILU)
+  c10::cuda::CUDAStream stream_;
+#elif defined(USE_MUSA)
+  c10::musa::MUSAStream stream_;
+#endif
+  const int32_t timeout_;
+};
+
+}  // namespace janus

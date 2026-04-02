@@ -1,0 +1,102 @@
+#include "block.h"
+
+#include <glog/logging.h>
+#include <string.h>
+
+#include <cstdint>
+
+#include "block_manager.h"
+
+namespace janus {
+Block::Block(int32_t id, BlockManager* manager)
+    : id_(id), ref_count_(new uint32_t(1)), manager_(manager) {
+  // get the block size from the manager
+  size_ = manager_ == nullptr ? 0 : manager_->block_size();
+}
+
+Block::~Block() {
+  // decrease reference count
+  dec_ref_count();
+}
+
+// copy constructor
+Block::Block(const Block& other)
+    : id_(other.id_),
+      size_(other.size_),
+      ref_count_(other.ref_count_),
+      manager_(other.manager_) {
+  memcpy(hash_value_, other.hash_value_, XXH3_128BITS_HASH_VALUE_LEN);
+
+  // increase reference count
+  inc_ref_count();
+}
+
+// copy assignment
+Block& Block::operator=(const Block& other) {
+  if (this != &other) {
+    dec_ref_count();
+
+    id_ = other.id_;
+    size_ = other.size_;
+    manager_ = other.manager_;
+    ref_count_ = other.ref_count_;
+
+    memcpy(hash_value_, other.hash_value_, XXH3_128BITS_HASH_VALUE_LEN);
+
+    inc_ref_count();
+  }
+  return *this;
+}
+
+Block::Block(Block&& other) noexcept
+    : id_(other.id_),
+      size_(other.size_),
+      ref_count_(other.ref_count_),
+      manager_(other.manager_) {
+  memcpy(hash_value_, other.hash_value_, XXH3_128BITS_HASH_VALUE_LEN);
+
+  // reset other without adjusting the reference count
+  other.id_ = -1;
+  other.size_ = 0;
+  other.ref_count_ = nullptr;
+  other.manager_ = nullptr;
+}
+
+Block& Block::operator=(Block&& other) noexcept {
+  if (this != &other) {
+    dec_ref_count();
+
+    id_ = other.id_;
+    size_ = other.size_;
+    manager_ = other.manager_;
+    ref_count_ = other.ref_count_;
+
+    memcpy(hash_value_, other.hash_value_, XXH3_128BITS_HASH_VALUE_LEN);
+
+    other.id_ = -1;
+    other.size_ = 0;
+    other.ref_count_ = nullptr;
+    other.manager_ = nullptr;
+  }
+
+  return *this;
+}
+
+void Block::inc_ref_count() {
+  if (ref_count_ != nullptr) {
+    ++(*ref_count_);
+  }
+}
+
+void Block::dec_ref_count() {
+  if (ref_count_ != nullptr && --(*ref_count_) == 0) {
+    // release the reference count memory
+    delete ref_count_;
+    // return the block id to the manager
+    if (manager_ != nullptr) {
+      manager_->free(id_);
+    }
+  }
+}
+
+}  // namespace janus

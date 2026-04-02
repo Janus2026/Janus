@@ -1,0 +1,257 @@
+syntax = "proto3";
+
+package janus.proto;
+option cc_generic_services = true;
+
+import "common.proto";
+
+message ClusterInfos {
+  repeated uint64 cluster_ids = 1;
+  repeated string device_ips = 2;
+  repeated uint32 ports = 3;
+  int32 dp_size = 4;
+  repeated string addrs = 5;
+}
+
+// request from prefill to decode.
+// NOTE: maybe we should dispatch request to decod instance by janus_service.
+message DisaggRequests {
+  // prefill instance name(ID)
+  string prefill_name = 1;
+  repeated DisaggRequest reqs = 2;
+  ClusterInfos cluster_infos = 3;
+}
+
+message StopSequence {
+  repeated int32 seq_tokens = 1;
+}
+
+message DisaggRequest {
+  // req id
+  string req_id = 1;
+  // req id which is generated in janus service
+  string service_req_id = 2;
+  // tokens num decide the blocks slots
+  int64 tokens_num = 3;
+  // request fields
+  string prompt = 4;
+  bool stream = 5;
+  string x_request_id = 6;
+  string x_request_time = 7;
+  int32 max_tokens = 8;
+  int32 max_context_len = 9;
+  int32 seq_capacity = 10;
+  bool ignore_eos = 11;
+  int32 eos_token_id = 12;
+  repeated int32 stop_token_ids = 13;
+  repeated StopSequence stop_sequences = 14;
+  int32 n = 15;
+  int32 best_of = 16;
+  float frequency_penalty = 17;
+  float presence_penalty = 18;
+  float repetition_penalty = 19;
+  float temperature = 20;
+  float top_p = 21;
+  int64 top_k = 22;
+  bool logprobs = 23;
+  int64 top_logprobs = 24;
+  bool is_embeddings = 25;
+  bool echo = 26;
+  bool skip_special_tokens = 27;
+  repeated int32 prompt_tokens = 28;
+  bool offline = 29;
+  optional int32 ttlt_slo_ms = 30;
+  optional Priority priority = 31;
+  optional int32 ttft_slo_ms = 32;
+  optional int32 tpot_slo_ms = 33;
+  optional int32 tpot_priority_weight = 34;
+  optional int32 ttft_priority_weight = 35;
+  optional int32 ttlt_priority_weight = 36;
+  optional int32 priority_weight = 37;
+  string source_xservice_addr = 38;
+
+}
+
+// response for DisaggRequests from decode instance.
+message DisaggResponses {
+  repeated DisaggResponse resps = 1;
+}
+
+message DisaggResponse {
+  // req id
+  string req_id = 1;
+  // http code
+  int32 status_code = 2;
+  // blocks ids allocated for request.
+  repeated int32 blocks_ids = 3;
+  int32 dp_rank = 4;
+
+  // XTensor mode: GlobalXTensor offsets for each block (per-layer)
+  // For each layer, there are K/V offsets and optional MLA index offsets.
+  repeated XTensorLayerOffsets xtensor_layer_offsets = 5;
+  XTensorBlockBytes xtensor_block_bytes = 6;
+}
+
+// XTensor mode: offsets for one layer
+message XTensorLayerOffsets {
+  // K cache offsets for each block in GlobalXTensor
+  repeated uint64 k_offsets = 1;
+  // V cache offsets for each block in GlobalXTensor
+  repeated uint64 v_offsets = 2;
+  // Optional MLA index offsets for each block in GlobalXTensor
+  repeated uint64 index_offsets = 3;
+}
+
+message XTensorBlockBytes {
+  uint64 k_block_bytes = 1;
+  uint64 v_block_bytes = 2;
+  uint64 index_block_bytes = 3;
+}
+
+// Deprecated: Use DisaggGenerationsRequest instead
+// TODO: support multi sequences in one request.
+//       Now only consider one sequence case.
+// TODO: support embedding, now we only support tokens.
+// message DisaggGeneration {
+//   // req id
+//   string req_id = 1;
+//   // token id
+//   int64 token_id = 2;
+//   bool has_logprob = 3;
+//   float logprob = 4;
+//   repeated int64 top_tokens = 5;
+//   repeated float top_logprobs = 6;
+//   string kv_cache_transfer_mode = 7;
+//   repeated uint64 cluster_ids = 8;
+//   repeated string addrs = 14;
+//   repeated int64 k_cache_ids = 9;
+//   repeated int64 v_cache_ids = 10;
+//   repeated int32 block_ids = 11;
+//   int32 dp_size = 12;
+//   int32 dp_rank = 13;
+// }
+
+// Deprecated: Use DisaggGenerationsRequests instead
+// First token from prefill instance to decode instance.
+// message DisaggGenerations {
+//   repeated DisaggGeneration gens = 1;
+// }
+
+message OutputUsage {
+  // the number of tokens in the prompt.
+  int32 num_prompt_tokens = 1;
+  // the number of tokens in the generated completion.
+  int32 num_generated_tokens = 2;
+  // the total number of tokens used in the request (prompt + completion).
+  int32 num_total_tokens = 3;
+}
+
+message LogProbData {
+  // the text of the token
+  string token = 1;
+  // the token id
+  int32 token_id = 2;
+  // the log probability of the token
+  float logprob = 3;
+  // whether the token is finished
+  bool finished_token = 4;
+}
+
+message LogProb {
+  LogProbData log_prob_data = 1;
+  repeated LogProbData top_logprobs = 2;
+}
+
+message SequenceOutput {
+  // the index of the sequence in the request.
+  int32 index = 1;
+  // the generated/delta text.
+  // delta text is the text generated since the last response for streaming.
+  string text = 2;
+  // the token ids of the generated text.
+  repeated int32 token_ids = 3;
+  // the reason the sequence finished.
+  string finish_reason = 4;
+  // log probabilities of the generated tokens.
+  repeated LogProb logprobs = 5;
+}
+
+message GenerationStatus {
+  int32 status_code = 1;
+  string status_msg = 2;
+}
+
+// Stream response token to prefill instance from decode.
+message DisaggStreamGeneration {
+  // req id
+  string req_id = 1;
+  // req id which is generated in janus service.
+  string service_req_id = 2;
+  // the status of the request
+  GenerationStatus gen_status = 3;
+  // maybe multi sequences in the request
+  repeated SequenceOutput outputs = 4;
+  OutputUsage usage = 5;
+  bool finished = 6;
+  bool finished_on_prefill_instance = 7;
+}
+
+message DisaggStreamGenerations {
+  repeated DisaggStreamGeneration gens = 1;
+}
+
+message StatusSet {
+  repeated Status all_status = 1;
+}
+
+message PullSignal {
+  string source_instance_name = 1;
+  int64 preferred_req_len = 2;
+  int64 max_total_len = 3;
+}
+
+message RemoteToken {
+  int64 token_id = 1;
+  bool has_logprob = 2;
+  float logprob = 3;
+  repeated int64 top_tokens = 4;
+  repeated float top_logprobs = 5;
+  double time_to_first_token_latency_seconds = 6;
+}
+
+message DisaggGenerationsRequest {
+  string req_id = 1;
+  repeated RemoteToken tokens = 2;
+  string kv_cache_transfer_mode = 3;
+  repeated uint64 cluster_ids = 4;
+  repeated string addrs = 5;
+  repeated int64 k_cache_ids = 6;
+  repeated int64 v_cache_ids = 7;
+  repeated int32 block_ids = 8;
+  int32 dp_size = 9;
+  int32 dp_rank = 10;
+  string x_request_id = 11;
+  string x_request_time = 12;
+}
+
+message DisaggGenerationsRequests {
+  repeated DisaggGenerationsRequest multi_gens = 1;
+}
+
+message InstanceClusterInfo {
+  string instance_name = 1;
+  repeated uint64 cluster_ids = 2;
+  repeated string addrs = 3;
+  repeated string device_ips = 4;
+  repeated uint32 ports = 5;
+  int32 dp_size = 6;
+}
+
+service DisaggPDService {
+  rpc AddNewRequests(DisaggRequests) returns (DisaggResponses) {}
+  rpc FirstGeneration(DisaggGenerationsRequests) returns (Status) {}
+  rpc MultiGenerations(DisaggGenerationsRequests) returns (Status) {}
+  rpc SendPullSignal(PullSignal) returns (Status) {}
+  rpc LinkInstance(InstanceClusterInfo) returns (Status) {}
+  rpc UnlinkInstance(InstanceClusterInfo) returns (Status) {}
+}

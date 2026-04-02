@@ -1,0 +1,23 @@
+include(cc_library)
+
+cc_library(
+  NAME
+    janus_ops
+  HDRS
+    janus_ops_api.h
+    ../utils.h
+  SRCS
+    replace_token.cpp
+    top_k_top_p.cpp
+    ../utils.cpp
+    beam_search.cpp
+    select_unshared_kv.cpp
+    beam_search_rec.cpp
+  DEPS
+    atb
+    torch_npu
+    gflags::gflags
+    nlohmann_json::nlohmann_json
+    opapi
+    spdlog::spdlog
+)

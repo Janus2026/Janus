@@ -1,0 +1,137 @@
+#ifndef JANUS_LLM_DEFAULT_H
+#define JANUS_LLM_DEFAULT_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "types.h"
+
+const JANUS_InitOptions JANUS_INIT_LLM_OPTIONS_DEFAULT = {
+    .enable_mla = false,
+    .enable_chunked_prefill = false,
+    .enable_prefill_sp = false,
+    .enable_prefix_cache = false,
+    .enable_disagg_pd = false,
+    .enable_pd_ooc = false,
+    .enable_schedule_overlap = false,
+    .enable_shm = false,
+
+    .transfer_listen_port = 26000,
+    .nnodes = 1,
+    .node_rank = 0,
+    .dp_size = 1,
+    .ep_size = 1,
+    .block_size = 32,
+    .max_cache_size = 0,
+    .max_tokens_per_batch = 20480,
+    .max_seqs_per_batch = 256,
+    .max_tokens_per_chunk_for_prefill = 0,
+    .num_speculative_tokens = 0,
+    .num_request_handling_threads = 4,
+    .expert_parallel_degree = 0,
+    .server_idx = 0,
+    .max_memory_utilization = 0.9,
+
+    .task = "generate",
+    .communication_backend = "lccl",
+    .instance_role = "DEFAULT",
+    .device_ip = "",
+    .master_node_addr = "127.0.0.1:18899",
+    .xservice_addr = "",
+    .instance_name = "",
+    .kv_cache_transfer_mode = "PUSH",
+    .log_dir = "",
+    .draft_model = "",
+    .draft_devices = ""};
+
+const JANUS_RequestParams JANUS_LLM_REQUEST_PARAMS_DEFAULT = {
+    .echo = false,
+    .offline = false,
+    .logprobs = false,
+    .ignore_eos = false,
+
+    .n = 1,
+    .max_tokens = 5120,
+    .best_of = 1,
+    .ttlt_slo_ms = INT32_MAX,
+    .ttft_slo_ms = INT32_MAX,
+    .tpot_slo_ms = INT32_MAX,
+    .beam_width = 0,
+    .top_logprobs = 0,
+    .top_k = -1,
+    .top_p = 1.0,
+    .frequency_penalty = 0.0,
+    .presence_penalty = 0.0,
+    .repetition_penalty = 1.0,
+    .temperature = 0.0,
+    .request_id = ""};
+
+const JANUS_InitOptions JANUS_INIT_REC_OPTIONS_DEFAULT = {
+    .enable_mla = false,
+    .enable_chunked_prefill = false,
+    .enable_prefill_sp = false,
+    .enable_prefix_cache = false,
+    .enable_disagg_pd = false,
+    .enable_pd_ooc = false,
+    .enable_schedule_overlap = false,
+    .enable_shm = false,
+
+    .transfer_listen_port = 26000,
+    .nnodes = 1,
+    .node_rank = 0,
+    .dp_size = 1,
+    .ep_size = 1,
+    .block_size = 1,
+    .max_cache_size = 1000000,
+    .max_tokens_per_batch = 4096,
+    .max_seqs_per_batch = 4,
+    .max_tokens_per_chunk_for_prefill = 0,
+    .num_speculative_tokens = 0,
+    .num_request_handling_threads = 4,
+    .expert_parallel_degree = 0,
+    .server_idx = 0,
+    .beam_width = 128,
+    .max_decode_rounds = 3,
+    .max_token_per_req = 1000,
+    .max_memory_utilization = 0.55,
+
+    .task = "generate",
+    .communication_backend = "lccl",
+    .instance_role = "DEFAULT",
+    .device_ip = "",
+    .master_node_addr = "127.0.0.1:18899",
+    .xservice_addr = "",
+    .instance_name = "",
+    .kv_cache_transfer_mode = "PUSH",
+    .log_dir = "",
+    .draft_model = "",
+    .draft_devices = ""};
+
+const JANUS_RequestParams JANUS_REC_REQUEST_PARAMS_DEFAULT = {
+    .echo = false,
+    .offline = false,
+    .logprobs = false,
+    .ignore_eos = false,
+
+    .n = 1,
+    .max_tokens = 5120,
+    .best_of = 1,
+    .ttlt_slo_ms = INT32_MAX,
+    .ttft_slo_ms = INT32_MAX,
+    .tpot_slo_ms = INT32_MAX,
+    .beam_width = 128,
+    .top_logprobs = 0,
+    .top_k = -1,
+    .top_p = 1.0,
+    .frequency_penalty = 0.0,
+    .presence_penalty = 0.0,
+    .repetition_penalty = 1.0,
+    .temperature = 0.0,
+    .request_id = ""};
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // JANUS_LLM_DEFAULT_H

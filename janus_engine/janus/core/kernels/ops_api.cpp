@@ -1,0 +1,943 @@
+#include "ops_api.h"
+
+#if defined(USE_MLU)
+#include "mlu/mlu_ops_api.h"
+#elif defined(USE_NPU)
+#include "npu/npu_ops_api.h"
+#include "triton_npu/torch_api/triton_ops_api.h"
+#elif defined(USE_CUDA)
+#include "cuda/attention_runner.h"
+#include "cuda/cuda_ops_api.h"
+#elif defined(USE_ILU)
+#include "ilu/ilu_ops_api.h"
+#elif defined(USE_MUSA)
+#include "cuda/cuda_ops_api.h"
+#include "musa/musa_ops_api.h"
+#endif
+
+#include <numeric>
+
+#include "common/macros.h"
+#include "layers/common/attention_metadata.h"
+
+namespace janus::kernel {
+
+void apply_rotary(RotaryParams& params) {
+#if defined(USE_MLU)
+  mlu::apply_rotary(params.q,
+                    params.k,
+                    params.sin,
+                    params.cos,
+                    params.position_ids,
+                    params.cu_query_lens,
+                    params.interleaved,
+                    params.discrete,
+                    params.dynamic_ntk,
+                    params.max_query_len);
+#elif defined(USE_NPU)
+  npu::apply_rotary(
+      params.q, params.k, params.cos_sin, params.position_ids.value());
+#elif defined(USE_CUDA) || defined(USE_MUSA)
+  bool is_neox = !params.interleaved;
+  torch::Tensor pos_ids;
+  torch::Tensor cos_sin;
+
+  if (params.position_ids.has_value()) {
+    // positions is already int64 on CUDA/MUSA (pre-converted in
+    // ForwardInput::to).
+    pos_ids = params.position_ids.value().to(torch::kInt64);
+  } else if (params.cu_query_lens.has_value()) {
+    auto cu = params.cu_query_lens.value().to(torch::kInt64);
+    CHECK(cu.numel() >= 2) << "apply_rotary (CUDA): cu_query_lens must have at "
+                              "least 2 elements when "
+                              "position_ids is not provided.";
+    int64_t seq_len = cu[1].item<int64_t>() - cu[0].item<int64_t>();
+    CHECK(seq_len > 0)
+        << "apply_rotary (CUDA): invalid sequence length inferred from "
+           "cu_query_lens when position_ids is not provided.";
+    pos_ids = torch::arange(seq_len,
+                            torch::TensorOptions()
+                                .dtype(torch::kInt64)
+                                .device(params.q.device()))
+                  .contiguous();
+  } else {
+    // When neither position_ids nor cu_query_lens is provided,
+    // infer sequence length from q tensor and create default position IDs.
+    // This handles cases like LongCat-Image-Edit where rotary embedding
+    // is applied uniformly across all sequence positions.
+    int64_t seq_len = params.q.size(0);
+    CHECK(seq_len > 0) << "apply_rotary (CUDA): cannot infer valid sequence "
+                          "length from q tensor.";
+    pos_ids = torch::arange(seq_len,
+                            torch::TensorOptions()
+                                .dtype(torch::kInt64)
+                                .device(params.q.device()))
+                  .contiguous();
+  }
+
+  if (params.precomputed_cos_sin.defined()) {
+    cos_sin = params.precomputed_cos_sin;
+  } else if (params.cos.defined() && params.sin.defined()) {
+    const int64_t head_dim = params.cos.size(-1);
+    const int64_t rot_half = head_dim / 2;
+    auto cos_sliced = params.cos.contiguous().slice(-1, 0, rot_half);
+    auto sin_sliced = params.sin.contiguous().slice(-1, 0, rot_half);
+    cos_sin = torch::cat({cos_sliced, sin_sliced}, -1);
+  } else if (params.cos_sin.defined()) {
+    auto cos_sin_vec = params.cos_sin.chunk(4, -1);
+    auto cos = cos_sin_vec[0];
+    auto sin = cos_sin_vec[2];
+    cos_sin = torch::cat({cos, sin}, -1);
+  } else {
+    LOG(FATAL) << "apply_rotary (CUDA): neither cos_sin nor cos/sin "
+                  "provided; cannot infer cos_sin.";
+  }
+
+  cuda::rotary_embedding(pos_ids, params.q, params.k, cos_sin, is_neox);
+#elif defined(USE_ILU)
+  torch::Tensor ilu_cos_sin;
+  if (params.precomputed_cos_sin.defined()) {
+    ilu_cos_sin = params.precomputed_cos_sin;
+  } else {
+    auto cos_sin_vec = params.cos_sin.chunk(4, -1);
+    ilu_cos_sin = torch::cat({cos_sin_vec[0], cos_sin_vec[2]}, -1);
+  }
+  // positions is already int64 on ILU (pre-converted in ForwardInput::to).
+  torch::Tensor long_position_ids = params.position_ids.value().to(at::kLong);
+  ilu::apply_rope_pos_ids_cos_sin_cache(
+      params.q, params.k, ilu_cos_sin, long_position_ids, params.interleaved);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void active(ActivationParams& params) {
+#if defined(USE_MLU)
+  mlu::active(params.input,
+              params.output,
+              params.bias,
+              params.cusum_token_count,
+              params.act_mode,
+              params.is_gated,
+              params.start_expert_id,
+              params.expert_size);
+#elif defined(USE_NPU)
+  params.output = npu::active(params.input, params.act_mode);
+#elif defined(USE_CUDA) || defined(USE_MUSA)
+  cuda::act_and_mul(params.output, params.input, params.act_mode);
+#elif defined(USE_ILU)
+  ilu::act_and_mul(params.output, params.input, params.act_mode);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void reshape_paged_cache(ReshapePagedCacheParams& params) {
+#if defined(USE_MLU)
+  mlu::reshape_paged_cache(params.key,
+                           params.value,
+                           params.k_cache,
+                           params.v_cache,
+                           params.slot_mapping,
+                           params.direction);
+#elif defined(USE_NPU)
+  npu::reshape_paged_cache(params.key,
+                           params.value,
+                           params.k_cache,
+                           params.v_cache,
+                           params.slot_mapping);
+#elif defined(USE_CUDA) || defined(USE_MUSA)
+  cuda::reshape_paged_cache(params.slot_mapping,
+                            params.key,
+                            params.value.value_or(torch::Tensor()),
+                            params.k_cache,
+                            params.v_cache.value_or(torch::Tensor()));
+#elif defined(USE_ILU)
+  // auto v_cache = params.v_cache.value_or(torch::Tensor());
+  ilu::reshape_paged_cache(params.key,
+                           params.value,
+                           params.k_cache,
+                           params.v_cache,
+                           params.slot_mapping);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void reshape_from_cache(ReshapeFromCacheParams& params) {
+#if defined(USE_MLU)
+  mlu::reshape_from_cache(params.key,
+                          params.value,
+                          params.key_cache,
+                          params.value_cache,
+                          params.context_lengths,
+                          params.max_context_len,
+                          params.context_seq_offset,
+                          params.block_tables,
+                          params.cache_seq_offset);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void quant_to_paged_cache(ReshapePagedCacheParams& params) {
+#if defined(USE_MLU)
+  CHECK(params.k_cache_scale.has_value())
+      << "k_cache_scale is required for quant_to_paged_cache";
+  mlu::quant_to_paged_cache(params.key,
+                            params.value,
+                            params.k_cache,
+                            params.v_cache,
+                            params.k_cache_scale.value(),
+                            params.v_cache_scale,
+                            params.slot_mapping);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void dequant_from_paged_cache(ReshapeFromCacheParams& params) {
+#if defined(USE_MLU)
+  CHECK(params.key_cache_quant_scale.has_value())
+      << "key_cache_quant_scale is required for dequant_from_paged_cache";
+  mlu::dequant_from_paged_cache(params.key,
+                                params.value,
+                                params.key_cache,
+                                params.value_cache,
+                                params.key_cache_quant_scale.value(),
+                                params.value_cache_quant_scale,
+                                params.context_lengths,
+                                params.max_context_len,
+                                params.context_seq_offset,
+                                params.block_tables.value(),
+                                params.quant_mode,
+                                params.quant_bit);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void fused_layernorm(FusedLayerNormParams& params) {
+#if defined(USE_MLU)
+  mlu::fused_layernorm(params.input,
+                       params.output,
+                       params.residual,
+                       params.weight,
+                       params.beta,
+                       params.bias,
+                       params.quant_scale,
+                       params.residual_out,
+                       params.smooth_quant_scale,
+                       params.normed_out,
+                       params.mode,
+                       params.eps,
+                       params.store_output_before_norm,
+                       params.store_output_after_norm,
+                       params.dynamic_quant);
+#elif defined(USE_MUSA)
+  musa::fused_layernorm(params.input,
+                        params.output,
+                        params.residual,
+                        params.weight,
+                        params.beta,
+                        params.bias,
+                        params.quant_scale,
+                        params.residual_out,
+                        params.smooth_quant_scale,
+                        params.normed_out,
+                        params.mode,
+                        params.eps,
+                        params.store_output_before_norm,
+                        params.store_output_after_norm,
+                        params.dynamic_quant);
+#elif defined(USE_NPU)
+  if (params.residual.has_value()) {
+    std::tie(params.output, std::ignore, params.residual_out) =
+        npu::add_rms_norm(
+            params.input, params.residual.value(), params.weight, params.eps);
+  } else {
+    params.output =
+        npu::rms_norm(params.input, params.weight, params.eps, params.mode);
+  }
+#elif defined(USE_CUDA) || defined(USE_MUSA)
+  if (params.residual.has_value()) {
+    cuda::fused_add_rms_norm(
+        params.input, params.residual.value(), params.weight, params.eps);
+    params.output = params.input;
+    params.residual_out = params.residual;
+  } else {
+    cuda::rms_norm(params.output, params.input, params.weight, params.eps);
+  }
+#elif defined(USE_ILU)
+  if (params.residual.has_value()) {
+    ilu::residual_layer_norm(params.input,
+                             params.output,
+                             params.residual,
+                             params.weight,
+                             params.bias,  // residual_bias
+                             params.residual_out,
+                             params.eps);
+  } else {
+    ilu::rms_norm(params.output, params.input, params.weight, params.eps);
+  }
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor matmul(MatmulParams& params) {
+#if defined(USE_MLU)
+  return mlu::matmul(
+      params.a, params.b, params.bias, params.c, params.alpha, params.beta);
+#elif defined(USE_NPU)
+  return npu::matmul(params.a, params.b, params.bias);
+#elif defined(USE_CUDA) || defined(USE_MUSA)
+  return cuda::matmul(params.a, params.b, params.bias);
+#elif defined(USE_ILU)
+  return ilu::matmul(params.a, params.b, params.bias);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor group_gemm(GroupGemmParams& params) {
+#if defined(USE_MLU)
+  return mlu::group_gemm(params.a,
+                         params.b,
+                         params.token_count,
+                         params.output,
+                         params.a_scale,
+                         params.b_scale,
+                         params.quant_flag,
+                         params.max_dim,
+                         params.trans_a,
+                         params.trans_b,
+                         params.a_quant_bit);
+#elif defined(USE_NPU)
+  std::vector<torch::Tensor> x_list;
+  std::vector<torch::Tensor> weight_list;
+  torch::TensorList x_ref;
+  torch::TensorList weight_ref;
+  if (params.x_list.has_value()) {
+    x_ref = params.x_list.value();
+  } else {
+    x_list = {params.a};
+    x_ref = x_list;
+  }
+  if (params.weight_list.has_value()) {
+    weight_ref = params.weight_list.value();
+  } else {
+    weight_list = {params.b};
+    weight_ref = weight_list;
+  }
+  std::optional<torch::Tensor> group_list = params.group_list;
+  if (!group_list.has_value()) {
+    group_list = params.token_count;
+  }
+
+  auto outputs =
+      npu::apply_npu_grouped_matmul(x_ref,
+                                    weight_ref,
+                                    params.bias_list,
+                                    params.scale_list,
+                                    params.offset_list,
+                                    params.antiquant_scale_list,
+                                    params.antiquant_offset_list,
+                                    params.per_token_scale_list,
+                                    group_list,
+                                    params.activation_input_list,
+                                    params.activation_quant_scale_list,
+                                    params.activation_quant_offset_list,
+                                    params.split_item,
+                                    params.group_type,
+                                    params.group_list_type,
+                                    params.act_type,
+                                    params.tuning_config,
+                                    params.output_dtype);
+  return outputs.back();
+#elif defined(USE_ILU)
+  return ilu::group_gemm(params.a,
+                         params.b,
+                         params.token_count,
+                         params.combine_idx,
+                         params.output);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor> moe_active_topk(
+    MoeFusedTopkParams& params) {
+#if defined(USE_MLU)
+  return mlu::moe_active_topk(params.input,
+                              params.topk,
+                              params.num_expert_group,
+                              params.topk_group,
+                              params.normalize,
+                              params.mask,
+                              params.normed_by,
+                              params.scoring_func,
+                              params.route_scale,
+                              params.e_score_correction_bias);
+#elif defined(USE_NPU)
+  CHECK_EQ(params.scoring_func, "softmax")
+      << "Only softmax is supported for NPU";
+  auto [topk_weights, topk_ids, row_ids] = npu::apply_moe_gating_topk_softmax(
+      params.input, params.finished, params.topk);
+  (void)row_ids;
+  return std::make_tuple(topk_weights, topk_ids);
+#elif defined(USE_ILU)
+  return ilu::moe_active_topk(params.input,
+                              params.topk,
+                              params.num_expert_group,
+                              params.topk_group,
+                              params.normalize,
+                              params.mask,
+                              params.normed_by,
+                              params.scoring_func,
+                              params.route_scale,
+                              params.e_score_correction_bias);
+#elif defined(USE_CUDA) || defined(USE_MUSA)
+  return cuda::moe_fused_topk(params.input,
+                              params.topk,
+                              params.normalize,
+                              params.e_score_correction_bias,
+                              params.scoring_func);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::vector<torch::Tensor> moe_gen_idx(MoeGenIdxParams& params) {
+#if defined(USE_MLU)
+  return mlu::moe_gen_idx(params.expert_id, params.expert_num);
+#elif defined(USE_ILU)
+  return ilu::moe_gen_idx(params.expert_id, params.expert_num);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor moe_expand_input(MoeExpandInputParams& params) {
+#if defined(USE_MLU)
+  return mlu::moe_expand_input(params.input,
+                               params.gather_index,
+                               params.cusum_token_count,
+                               params.start_expert_id,
+                               params.expert_size);
+#elif defined(USE_ILU)
+  return ilu::moe_expand_input(
+      params.input, params.gather_index, params.combine_idx, params.topk);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor moe_combine_result(MoeCombineResultParams& params) {
+#if defined(USE_MLU)
+  return mlu::moe_combine_result(params.input,
+                                 params.reduce_weight,
+                                 params.gather_ids,
+                                 params.residual,
+                                 params.cusum_token_count,
+                                 params.start_expert_id,
+                                 params.expert_size,
+                                 params.bias);
+#elif defined(USE_NPU)
+  std::optional<torch::Tensor> probes =
+      params.probes.has_value()
+          ? params.probes
+          : std::optional<torch::Tensor>(params.reduce_weight);
+  auto output = npu::apply_npu_moe_token_unpermute(params.input,
+                                                   params.gather_ids,
+                                                   probes,
+                                                   params.padded_mode,
+                                                   params.restore_shape);
+  if (params.residual.has_value()) {
+    output = output + params.residual.value();
+  }
+  return output;
+#elif defined(USE_ILU)
+  return ilu::moe_combine_result(params.input, params.reduce_weight);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor moe_all2all_gen_send_layout(
+    MoeAll2AllGenSendLayoutParams& params) {
+#if defined(USE_MLU)
+  return mlu::moe_all2all_gen_send_layout(params.token_count, params.nrank);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::vector<torch::Tensor> moe_all2all_gen_gather_index(
+    MoeAll2AllGenGatherIndexParams& params) {
+#if defined(USE_MLU)
+  return mlu::moe_all2all_gen_gather_index(
+      params.token_num, params.pad_num, params.return_cusum_token_count);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::vector<torch::Tensor> moe_all2all_create(MoeAll2AllCreateParams& params) {
+#if defined(USE_MLU)
+  return mlu::moe_all2all_create(params.dispatch_token_byte,
+                                 params.combine_token_byte,
+                                 params.max_expert_num,
+                                 params.max_token_num,
+                                 params.rank,
+                                 params.nrank,
+                                 params.device);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void moe_all2all_init(MoeAll2AllInitParams& params) {
+#if defined(USE_MLU)
+  mlu::moe_all2all_init(params.handle, params.all_exchange_info, params.device);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void moe_all2all_dispatch(MoeAll2AllDispatchParams& params) {
+#if defined(USE_MLU)
+  mlu::moe_all2all_dispatch(params.handle,
+                            params.token_byte,
+                            params.token_num,
+                            params.send_layout,
+                            params.send_token_num,
+                            params.recv_layout,
+                            params.recv_token_num,
+                            params.send_token,
+                            params.recv_token);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void moe_all2all_combine(MoeAll2AllCombineParams& params) {
+#if defined(USE_MLU)
+  mlu::moe_all2all_combine(params.handle,
+                           params.token_byte,
+                           params.token_num,
+                           params.send_src_layout,
+                           params.send_dst_layout,
+                           params.send_token,
+                           params.recv_token);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void moe_all2all_destroy(MoeAll2AllDestroyParams& params) {
+#if defined(USE_MLU)
+  mlu::moe_all2all_destroy(params.handle, params.device);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor> scaled_quantize(
+    ScaledQuantizeParams& params) {
+#if defined(USE_MLU)
+  return mlu::scaled_quantize(params.x,
+                              params.smooth,
+                              params.zero,
+                              params.token_count,
+                              params.gather_index,
+                              params.gather_index_start_position,
+                              params.output,
+                              params.output_scale,
+                              params.act_mode,
+                              params.active_coef,
+                              params.is_gated,
+                              params.quant_type);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor scaled_matmul(ScaledMatmulParams& params) {
+#if defined(USE_MLU)
+  return mlu::scaled_matmul(params.a,
+                            params.b,
+                            params.a_scale,
+                            params.b_scale,
+                            params.output_dtype,
+                            params.bias,
+                            params.c,
+                            params.act_mode,
+                            params.quant_bit_size,
+                            params.alpha,
+                            params.beta,
+                            params.use_hp_active,
+                            params.a_quant_bit_size,
+                            params.a_calib,
+                            params.b_calib,
+                            params.output);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor apply_top_k_top_p(TopKPParams& params) {
+#if defined(USE_MLU)
+  return mlu::apply_top_k_top_p(
+      params.logits, params.temperatures, params.top_k, params.top_p);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor random_sample(RandomSampleParams& params) {
+#if defined(USE_MLU)
+  return mlu::random_sample(params.logits);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor rejection_sample(RejectionSampleParams& params) {
+#if defined(USE_MLU)
+  return mlu::rejection_sample(params.draft_token_ids,
+                               params.num_draft_tokens,
+                               params.cu_num_draft_tokens,
+                               params.draft_probs,
+                               params.target_probs,
+                               params.bonus_token_ids,
+                               params.uniform_rand,
+                               params.uniform_probs,
+                               params.max_spec_len);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void masked_indexer_select_paged_kv(MaskedIndexerSelectPagedKVParams& params) {
+#if defined(USE_MLU)
+  mlu::masked_indexer_select_paged_kv(params.query,
+                                      params.k_cache,
+                                      params.weights,
+                                      params.kv_cache_block_table,
+                                      params.cu_seq_q_lens,
+                                      params.cu_seq_k_lens,
+                                      params.k_context_lens,
+                                      params.k_cache_block_table,
+                                      params.is_prefill,
+                                      params.index_topk,
+                                      params.kv_cache_block_size,
+                                      params.softmax_scale,
+                                      params.q_scale,
+                                      params.k_scale_cache,
+                                      params.sparse_block_table,
+                                      params.sparse_context_lens);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void gather_split(GatherSplitParams& params) {
+#if defined(USE_MLU)
+  mlu::gather_split(params.input,
+                    params.gather_index,
+                    params.valid_token_num,
+                    params.output_head,
+                    params.output_tail);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void fused_mla_q(FusedMlaQParams& params) {
+#if defined(USE_MLU)
+  mlu::fused_mla_q(params.q,
+                   params.output,
+                   params.output_scale,
+                   params.output_norm,
+                   params.gamma,
+                   params.smooth_quant_scale,
+                   params.weight_b,
+                   params.weight_b_scale,
+                   params.weight_c,
+                   params.sin,
+                   params.cos,
+                   params.position_id,
+                   params.quant_mode,
+                   params.eps,
+                   params.interleaved);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void fused_mla_kv(FusedMlaKVParams& params) {
+#if defined(USE_MLU)
+  mlu::fused_mla_kv(params.input_kv,
+                    params.sin,
+                    params.cos,
+                    params.position_id,
+                    params.gamma,
+                    params.kv_cache,
+                    params.kv_cache_scale,
+                    params.slot_mapping,
+                    params.cache_bs_id,
+                    params.cache_seq_offset,
+                    params.quant_mode,
+                    params.is_paged_cache,
+                    params.eps,
+                    params.interleaved);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void fused_indexer_q(FusedIndexerQParams& params) {
+#if defined(USE_MLU)
+  mlu::fused_indexer_q(params.input_q,
+                       params.output,
+                       params.output_scale,
+                       params.w_q,
+                       params.w_q_scale,
+                       params.hadamard_matrix,
+                       params.sin,
+                       params.cos,
+                       params.position_id,
+                       params.quant_mode,
+                       params.interleaved,
+                       params.rope_at_front);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void fused_indexer_k(FusedIndexerKParams& params) {
+#if defined(USE_MLU)
+  mlu::fused_indexer_k(params.x,
+                       params.wk,
+                       params.wproj,
+                       params.sin_table,
+                       params.cos_table,
+                       params.position_id,
+                       params.slot_mapping,
+                       params.head_weights,
+                       params.k_cache,
+                       params.k_cache_scale,
+                       params.hadamard_matrix,
+                       params.interleaved,
+                       params.gamma,
+                       params.beta,
+                       params.eps);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+moe_init_routing_v2(MoeInitRoutingV2Params& params) {
+#if defined(USE_NPU)
+  return npu::apply_npu_moe_init_routing_v2(params.x,
+                                            params.expert_idx,
+                                            params.scale,
+                                            params.offset,
+                                            params.active_num,
+                                            params.expert_capacity,
+                                            params.expert_num,
+                                            params.drop_pad_mode,
+                                            params.expert_tokens_num_type,
+                                            params.expert_tokens_num_flag,
+                                            params.quant_mode,
+                                            params.active_expert_range,
+                                            params.row_idx_type);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fp8_scaled_quantize(
+    Fp8ScaledQuantizeParams& params) {
+#if defined(USE_CUDA)
+  return cuda::fp8_scaled_quantize(params.input, params.output, params.scale);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::pair<torch::Tensor, torch::Tensor> fused_gdn_gating(
+    FusedGdnGatingParams& params) {
+#if defined(USE_NPU)
+  return npu::npu_fused_gdn_gating(params.A_log,
+                                   params.a,
+                                   params.b,
+                                   params.dt_bias,
+                                   params.beta,
+                                   params.threshold);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::pair<torch::Tensor, torch::Tensor> fused_recurrent_gated_delta_rule(
+    FusedRecurrentGatedDeltaRuleParams& params) {
+#if defined(USE_NPU)
+  return npu::npu_fused_recurrent_gated_delta_rule(
+      params.q,
+      params.k,
+      params.v,
+      params.g,
+      params.beta,
+      params.scale,
+      params.initial_state,
+      params.inplace_final_state,
+      params.cu_seqlens,
+      params.ssm_state_indices,
+      params.num_accepted_tokens,
+      params.use_qk_l2norm_in_kernel);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor fp8_scaled_matmul(Fp8ScaledMatmulParams& params) {
+#if defined(USE_CUDA)
+  auto out_2d = cuda::fp8_scaled_matmul(params.a,
+                                        params.b,
+                                        params.a_scale,
+                                        params.b_scale,
+                                        params.output_dtype,
+                                        params.bias,
+                                        params.output);
+
+  // Auto reshape output if original input shape is provided
+  if (params.input_shape.has_value()) {
+    auto out_shape = params.input_shape.value();
+    out_shape.back() = params.b.size(0);
+    return out_2d.view(out_shape);
+  }
+  return out_2d;
+#else
+  LOG(FATAL) << "fp8_scaled_matmul is only supported on CUDA";
+  return torch::Tensor();
+#endif
+}
+
+void static_scaled_fp8_quant(StaticScaledFp8QuantParams& params) {
+#if defined(USE_CUDA)
+  cuda::static_scaled_fp8_quant(params.output, params.input, params.scale);
+#else
+  LOG(FATAL) << "static_scaled_fp8_quant is only supported on CUDA";
+#endif
+}
+
+// Fused RMSNorm + Static FP8 Quantization
+torch::Tensor rms_norm_static_fp8_quant(RmsNormStaticFp8QuantParams& params) {
+#if defined(USE_CUDA)
+  auto org_shape = params.input.sizes().vec();
+  auto hidden_size = params.input.size(-1);
+
+  // Flatten input to 2D. Use reshape to support non-contiguous tensors.
+  auto input_2d = params.input.reshape({-1, hidden_size});
+
+  torch::Tensor output =
+      torch::empty({input_2d.size(0), hidden_size},
+                   input_2d.options().dtype(torch::kFloat8_e4m3fn));
+
+  // Call fused kernel
+  cuda::rms_norm_static_fp8_quant(
+      output, input_2d, params.weight, params.scale, params.epsilon);
+
+  return output.reshape(org_shape);
+#else
+  LOG(FATAL) << "rms_norm_static_fp8_quant is only supported on CUDA";
+  return torch::Tensor();
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fused_add_rms_norm_static_fp8_quant(
+    FusedAddRmsNormStaticFp8QuantParams& params) {
+#if defined(USE_CUDA)
+  auto org_shape = params.input.sizes().vec();
+  auto hidden_size = params.input.size(-1);
+
+  // Flatten tensors to 2D. Use reshape to support non-contiguous tensors.
+  auto input_2d = params.input.reshape({-1, hidden_size});
+  auto residual_2d = params.residual.reshape({-1, hidden_size});
+
+  torch::Tensor output =
+      torch::empty({input_2d.size(0), hidden_size},
+                   input_2d.options().dtype(torch::kFloat8_e4m3fn));
+
+  // Call fused kernel (residual is updated in-place)
+  cuda::fused_add_rms_norm_static_fp8_quant(output,
+                                            input_2d,
+                                            residual_2d,
+                                            params.weight,
+                                            params.scale,
+                                            params.epsilon);
+
+  // Reshape outputs
+  auto output_reshaped = output.reshape(org_shape);
+  auto residual_reshaped = residual_2d.reshape(org_shape);
+
+  return std::make_tuple(output_reshaped, residual_reshaped);
+#else
+  LOG(FATAL) << "fused_add_rms_norm_static_fp8_quant is only supported on CUDA";
+  return std::make_tuple(torch::Tensor(), torch::Tensor());
+#endif
+}
+
+torch::Tensor causal_conv1d_update(CausalConv1dUpdateParams& params) {
+#if defined(USE_NPU)
+  return npu::npu_causal_conv1d_update(params.x,
+                                       params.conv_state,
+                                       params.weight,
+                                       params.activation,
+                                       params.bias,
+                                       params.cache_seqlens,
+                                       params.conv_state_indices,
+                                       params.num_accepted_tokens,
+                                       params.query_start_loc,
+                                       params.max_query_len,
+                                       params.intermediate_conv_window,
+                                       params.pad_slot_id,
+                                       params.validate_data);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor gated_layer_norm(GatedLayerNormParams& params) {
+#if defined(USE_NPU)
+  return npu::layer_norm_fwd(params.x,
+                             params.weight,
+                             params.bias,
+                             params.eps,
+                             params.z,
+                             params.group_size,
+                             params.norm_before_gate,
+                             params.is_rms_norm);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::pair<torch::Tensor, torch::Tensor> partial_rotary_embedding(
+    PartialRotaryEmbeddingParams& params) {
+#if defined(USE_NPU)
+  return npu::apply_npu_partial_rotary_embedding(params.positions,
+                                                 params.query,
+                                                 params.key,
+                                                 params.head_size,
+                                                 params.rotary_dim,
+                                                 params.cos_sin_cache,
+                                                 params.is_neox_style);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+}  // namespace janus::kernel

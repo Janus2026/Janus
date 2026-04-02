@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package janus.proto;
+
+import "google/protobuf/struct.proto";
+
+message Function {
+  string name = 1;
+  string description = 2;
+  google.protobuf.Struct parameters = 3;
+}
+
+message Tool {
+  string type = 1;  // "function"
+  Function function = 2;
+}
+
+message ToolCall {
+  optional uint32 index = 1;
+  optional string id = 2;
+  string type = 3;  // "function"
+  FunctionCall function = 4;
+}
+
+message FunctionCall {
+  string name = 1;
+  string arguments = 2;  // JSON string
+}
+
+enum Priority {
+  DEFAULT = 0;
+
+  HIGH = 1;
+
+  NORMAL = 2;
+
+  LOW = 3;
+}
+
+
+message Usage {
+  // the number of tokens in the prompt.
+  optional int32 prompt_tokens = 1 [json_name="prompt_tokens"];
+
+  // the number of tokens in the generated completion.
+  optional int32 completion_tokens = 2 [json_name="completion_tokens"];
+
+  // the total number of tokens used in the request (prompt + completion).
+  optional int32 total_tokens = 3 [json_name="total_tokens"];
+}
+
+// Options for streaming response.
+message StreamOptions{
+  // if set, an additional chunk with usage will be streamed before the data: [DONE] message.
+  optional bool include_usage = 1;
+}
+
+message Status {
+  bool ok = 1;
+}
+
+message Routing {
+  string prefill_name = 1;
+
+  string decode_name = 2;
+
+  string decode_rpc_address = 3;
+}
+
+message Empty {}
+
+message AddressInfo {
+  // the ip adderss of worker process.
+  string address = 1;
+  int32 global_rank = 2;
+}
+
+message CommUniqueId {
+  bytes comm_unique_id = 1;
+}
+
+message CommUniqueIdList {
+  repeated CommUniqueId comm_unique_ids = 1;
+}
+
+enum MasterStatus {
+  WAKEUP = 0;
+  LIGHT_SLEEP = 1;
+  DEEP_SLEEP = 2;
+}

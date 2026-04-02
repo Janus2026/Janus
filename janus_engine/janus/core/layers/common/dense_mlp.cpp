@@ -1,0 +1,121 @@
+#include "dense_mlp.h"
+
+#include <glog/logging.h>
+
+#include "kernels/ops_api.h"
+#include "platform/device.h"
+
+namespace janus {
+namespace layer {
+
+DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
+                           int64_t intermediate_size,
+                           bool is_gated,
+                           bool has_bias,
+                           const std::string& hidden_act,
+                           bool enable_result_reduction,
+                           const QuantArgs& quant_args,
+                           ProcessGroup* process_group,
+                           const torch::TensorOptions& options)
+    : is_gated_(is_gated),
+      intermediate_size_(intermediate_size),
+      process_group_(process_group),
+      hidden_act_(hidden_act) {
+  // Check if using w8a8 smoothquant quantization
+  is_smoothquant_ = quant_args.quant_method() == kQuantMethodSmoothquant;
+
+  if (is_smoothquant_) {
+    // Safety check: only w8a8 smoothquant is supported
+    if (quant_args.bits() != 8 || !quant_args.activation_dynamic()) {
+      LOG(FATAL)
+          << "DenseMLP w8a8 mode only supports w8a8 smoothquant quantization. "
+          << "Got bits=" << quant_args.bits()
+          << ", activation_dynamic=" << quant_args.activation_dynamic();
+    }
+  }
+
+  // Determine extra args based on quantization mode
+  LinearExtraArgs gate_up_proj_extra_args("none", false);
+  LinearExtraArgs down_proj_extra_args("none", false);
+  if (is_smoothquant_) {
+    // For per-token smoothquant, use specific args
+    down_proj_extra_args = LinearExtraArgs(hidden_act_, is_gated_);
+  }
+
+  // 1. gate + up
+  int64_t out_feature = is_gated_ ? intermediate_size_ * 2 : intermediate_size_;
+  gate_up_proj_ =
+      register_module("gate_up_proj",
+                      ColumnParallelLinear(hidden_size,
+                                           out_feature,
+                                           /*bias=*/has_bias,
+                                           /*gather_output=*/false,
+                                           quant_args,
+                                           process_group_,
+                                           options,
+                                           gate_up_proj_extra_args));
+
+  act_ = register_module("act", Activation(hidden_act_, is_gated_));
+
+  // 2. down
+  down_proj_ = register_module("down_proj",
+                               RowParallelLinear(intermediate_size_,
+                                                 hidden_size,
+                                                 /*bias=*/has_bias,
+                                                 /*input_is_parallelized=*/true,
+                                                 enable_result_reduction,
+                                                 quant_args,
+                                                 process_group_,
+                                                 options,
+                                                 down_proj_extra_args));
+}
+
+torch::Tensor DenseMLPImpl::forward(const torch::Tensor& hidden_states) {
+  // input shape: [num_tokens, hidden_size]
+  auto gate_up = gate_up_proj_->forward(hidden_states);
+
+  if (is_smoothquant_) {
+    // For w8a8 quantization, the active operation is fused with the down_proj
+    return down_proj_->forward(gate_up);
+  } else {
+    torch::Tensor output;
+    if (Device::type_str() != "npu") {
+      int64_t batch_size = gate_up.sizes()[0];
+      output = torch::empty(
+          {batch_size, intermediate_size_ / process_group_->world_size()},
+          gate_up.options());
+    }
+
+    act_->forward(gate_up, output);
+    return down_proj_->forward(output);
+  }
+}
+
+void DenseMLPImpl::load_state_dict(const StateDict& state_dict) {
+  gate_up_proj_->load_state_dict(state_dict, {"gate_proj.", "up_proj."});
+  down_proj_->load_state_dict(state_dict.get_dict_with_prefix("down_proj."));
+}
+
+void DenseMLPImpl::load_state_dict(const StateDict& state_dict,
+                                   const std::vector<std::string>& gate_up_name,
+                                   const std::string& down_name) {
+  if (is_gated_) {
+    CHECK_EQ(gate_up_name.size(), 2);
+    gate_up_proj_->load_state_dict(state_dict, gate_up_name);
+  } else {
+    CHECK_EQ(gate_up_name.size(), 1);
+    gate_up_proj_->load_state_dict(
+        state_dict.get_dict_with_prefix(gate_up_name[0]));
+  }
+  down_proj_->load_state_dict(state_dict.get_dict_with_prefix(down_name));
+}
+
+std::optional<torch::Tensor> DenseMLPImpl::get_fp8_input_scale() const {
+  if (gate_up_proj_) {
+    return gate_up_proj_->get_input_scale();
+  }
+  return std::nullopt;
+}
+
+}  // namespace layer
+}  // namespace janus

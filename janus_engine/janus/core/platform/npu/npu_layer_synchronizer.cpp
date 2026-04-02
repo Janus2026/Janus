@@ -1,0 +1,44 @@
+#include "npu_layer_synchronizer.h"
+
+#include <glog/logging.h>
+
+namespace janus {
+
+NPULayerSynchronizerImpl::NPULayerSynchronizerImpl(const int64_t num_layers,
+                                                   const int32_t timeout)
+    : events_(num_layers, nullptr),
+      event_record_flags_(num_layers),
+      timeout_(timeout) {
+  uint32_t flags = ACL_EVENT_SYNC;
+  for (int64_t i = 0; i < num_layers; ++i) {
+    auto ret = aclrtCreateEventWithFlag(&events_[i], flags);
+    CHECK(ret == ACL_SUCCESS) << "Create event failed:" << ret;
+  }
+}
+
+NPULayerSynchronizerImpl::~NPULayerSynchronizerImpl() {
+  for (int64_t i = 0; i < events_.size(); ++i) {
+    aclrtDestroyEvent(events_[i]);
+  }
+}
+
+aclrtEvent* NPULayerSynchronizerImpl::get_event(const int64_t layer_index) {
+  return &events_[layer_index];
+}
+
+std::atomic<bool>* NPULayerSynchronizerImpl::get_event_flag(
+    const int64_t layer_index) {
+  return &event_record_flags_[layer_index];
+}
+
+bool NPULayerSynchronizerImpl::synchronize_layer(const int64_t layer_index) {
+  while (!event_record_flags_[layer_index].load(std::memory_order_acquire));
+  auto ret = aclrtSynchronizeEventWithTimeout(events_[layer_index], timeout_);
+  if (ret != ACL_SUCCESS) {
+    LOG(ERROR) << "Synchronize event failed: " << ret;
+    return false;
+  }
+  return true;
+}
+
+}  // namespace janus
