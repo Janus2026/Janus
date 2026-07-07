@@ -1,8 +1,11 @@
-![Janus Logo](pics/janus_logo.jpg)
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="pics/janus_logo_dark.png">
+    <img src="pics/janus_logo.png" alt="Janus Logo" width="240"/>
+  </picture>
+</div>
 
-# Janus
-
-**Multi-LLM Serving at Production Scale**
+## Janus: Multi-LLM Serving at Production Scale
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Conference](https://img.shields.io/badge/SOSP-2026-b31b1b.svg)](#citation)
